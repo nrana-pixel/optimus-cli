@@ -1,0 +1,53 @@
+{
+  "name": "cli-project",
+  "version": "1.0.0",
+  "description": "A Node.js CLI project with pnpm workspace and oclif",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cli-project": "./bin/dev.js",
+    "ai": "./bin/dev.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "start": "node bin/dev.js",
+    "chat": "node bin/dev.js chat",
+    "config-cli": "node bin/dev.js config",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "cli",
+    "oclif"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@oclif/core": "^3.26.0",
+    "@oclif/plugin-help": "^6.0.0",
+    "@oclif/plugin-version": "^2.0.0",
+    "dotenv": "^16.3.1",
+    "litellm": "^0.12.0",
+    "prompts": "^2.4.2",
+    "simple-git": "^3.31.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/prompts": "^2.4.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "oclif": {
+    "bin": "cli-project",
+    "dirname": "cli-project",
+    "commands": "dist/commands",
+    "plugins": [
+      "@oclif/plugin-help",
+      "@oclif/plugin-version"
+    ]
+  }
+}

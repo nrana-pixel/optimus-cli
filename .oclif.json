@@ -1,0 +1,10 @@
+{
+  "bin": "cli-project",
+  "dirname": "cli-project",
+  "description": "A Node.js CLI project with pnpm workspace and oclif",
+  "commands": "dist/commands",
+  "plugins": [
+    "@oclif/plugin-help",
+    "@oclif/plugin-version"
+  ]
+}
