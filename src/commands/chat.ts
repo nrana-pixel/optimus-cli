@@ -46,6 +46,9 @@ const CMDS = [
   { cmd: '/connect',    args: '<url>',      desc: 'Connect to a local/Colab model endpoint'        },
   { cmd: '/disconnect', args: '',           desc: 'Disconnect from local model, use cloud again'   },
   { cmd: '/tools',      args: '',           desc: 'Toggle tool use on/off'                         },
+  { cmd: '/plan',       args: '',           desc: 'Toggle plan mode (read-only, no writes)'        },
+  { cmd: '/undo',       args: '',           desc: 'Undo all file changes from last response'       },
+  { cmd: '/changes',    args: '',           desc: 'Show files changed this session'                },
   { cmd: '/cost',       args: '',           desc: 'Show tokens + estimated cost'                   },
   { cmd: '/save',       args: '',           desc: 'Force-save session to disk'                     },
   { cmd: '/sessions',   args: '',           desc: 'List saved sessions'                            },
@@ -105,7 +108,7 @@ class Prompt {
   // Prefix "  ❯ " = 4 printable chars
   private static readonly PFX = 4;
   // Max rows shown in dropdown
-  private static readonly MAX_DD = 8;
+  private static readonly MAX_DD = 16;
 
   constructor(
     private onLine: (line: string) => Promise<void>,
@@ -397,6 +400,7 @@ export default class Chat extends Command {
   private conv   = new ConversationService();
   private msgs:  { role: string; content: string }[] = [];
   private toolsEnabled = true;
+  private planMode     = false;
   private tokens = 0;
   private cost   = 0;
   private sessName = '';
@@ -404,6 +408,10 @@ export default class Chat extends Command {
   // ── Local model connection state ─────────────────────────────────────────────
   private localModelService: LocalModelService | null = null;
   private localModelMeta: LocalModel | null = null;
+
+  // ── Track last tools instance for /undo ──────────────────────────────────────
+  private lastTools: ToolsService | null = null;
+  private projectContext: string | null = null;
 
   async run() {
     const { flags } = await this.parse(Chat);
@@ -414,7 +422,14 @@ export default class Chat extends Command {
     this.sessName = `chat-${Date.now()}`;
     this.conv.createSession(this.sessName, cfg.apiProvider, this.llm.getModel());
 
+    // ── Load OPTIMUS.md project context ──
+    this.projectContext = ToolsService.readProjectContext(resolve('.'));
+
     this._banner();
+
+    if (this.projectContext) {
+      o(p(A.gr, '  📋 Loaded project context from OPTIMUS.md\n\n'));
+    }
 
     new Prompt(
       async (line) => {
@@ -484,13 +499,15 @@ export default class Chat extends Command {
     // ── Cloud LLM path ──────────────────────────────────────────────────────
     try {
       const systemMsg = this.toolsEnabled
-        ? [{ role: 'system', content: ToolsService.toolsSystemSection() }]
-        : [];
+        ? [{ role: 'system', content: ToolsService.toolsSystemSection(this.projectContext, this.planMode) }]
+        : (this.projectContext ? [{ role: 'system', content: `You are Optimus — an expert AI coding agent.\n\n## Project Context (from OPTIMUS.md)\n${this.projectContext}` }] : []);
       let msgs = [...systemMsg, ...this.msgs];
 
       const MAX_LOOPS = 8;
       let loops = 0;
       const tools = new ToolsService(resolve('.'));
+      tools.planMode = this.planMode;
+      this.lastTools = tools;
 
       while (loops < MAX_LOOPS) {
         loops++;
@@ -554,9 +571,13 @@ export default class Chat extends Command {
         const resultParts: string[] = [];
         for (const call of toolCalls) {
           o('\n');
-          const argHint = call.args.path ?? call.args.pattern ?? call.args.symbol ?? call.args.command ?? '';
+          const argHint = call.args.path ?? call.args.pattern ?? call.args.symbol ?? call.args.command ?? call.args.ref ?? '';
           if (call.name === 'write_file') {
             Spinner.notify(`  ✏  write_file → ${call.args.path ?? '?'}`);
+          } else if (call.name === 'edit_file') {
+            Spinner.notify(`  ✂  edit_file → ${call.args.path ?? '?'}`);
+          } else if (call.name.startsWith('git_')) {
+            Spinner.notify(`  📦 ${call.name}${argHint ? `(${argHint})` : ''}`);
           } else {
             Spinner.notify(`  🔧 ${call.name}(${argHint})`);
           }
@@ -565,8 +586,10 @@ export default class Chat extends Command {
           const result = await tools.execute(call);
           ts.stop('Optimus');
           resultParts.push(ToolsService.formatToolResult(result));
-          if (call.name !== 'write_file') {
+          if (call.name !== 'write_file' && call.name !== 'edit_file') {
             o(p(A.gy, `  ❖ ${(result.output || result.error || '').slice(0, 120)}\n`));
+          } else if (result.error) {
+            o(p(A.re, `  ⚠  ${result.error.slice(0, 120)}\n`));
           }
         }
 
@@ -592,7 +615,7 @@ export default class Chat extends Command {
           o(p(A.gr + A.b, '  │') + `  ${badge}  ${pathTxt}  ${lineTxt}\n`);
         }
         o(p(A.gr + A.b, `  ├${HR}┤\n`));
-        o(p(A.gr + A.b, '  │') + p(A.gy, `  ${tools.written.length} file(s) written`) + '\n');
+        o(p(A.gr + A.b, '  │') + p(A.gy, `  ${tools.written.length} file(s) written`) + p(A.gy, ' • /undo to revert') + '\n');
         o(p(A.gr + A.b, `  └${HR}┘\n\n`));
       }
 
@@ -896,6 +919,60 @@ export default class Chat extends Command {
         break;
       }
 
+      // /plan ───────────────────────────────────────────────────
+      case '/plan': {
+        this.planMode = !this.planMode;
+        if (this.planMode) {
+          o(p(A.cy + A.b, '  🔒 Plan mode ON') + p(A.gy, ' — the AI will explore and plan but NOT modify files.\n'));
+          o(p(A.gy, '  Use /plan again to switch back to full mode.\n'));
+        } else {
+          o(p(A.gr + A.b, '  ✏  Plan mode OFF') + p(A.gy, ' — the AI can now read AND write files.\n'));
+        }
+        break;
+      }
+
+      // /undo ───────────────────────────────────────────────────
+      case '/undo': {
+        if (!this.lastTools || this.lastTools.snapshots.length === 0) {
+          o(p(A.ye, '  ⚠  Nothing to undo — no files were changed in the last response.\n'));
+          break;
+        }
+        const restored = this.lastTools.undoAll();
+        if (restored.length === 0) {
+          o(p(A.ye, '  ⚠  Nothing to undo.\n'));
+        } else {
+          o(p(A.gr + A.b, '  ↩ Undo complete:\n'));
+          for (const line of restored) {
+            o(p(A.gy, `    ${line}\n`));
+          }
+          o(p(A.gy, `  ${restored.length} file(s) restored to their previous state.\n`));
+        }
+        break;
+      }
+
+      // /changes ────────────────────────────────────────────────
+      case '/changes': {
+        if (!this.lastTools || this.lastTools.written.length === 0) {
+          o(p(A.ye, '  ⚠  No files changed in this session yet.\n'));
+          break;
+        }
+        const W  = 54;
+        const HR = '─'.repeat(W);
+        o(p(A.gr + A.b, `  ┌${HR}┐\n`));
+        o(p(A.gr + A.b,  '  │') + p(A.b + A.wh, '  ⚡ Changes This Session') + p(A.gy, ' '.repeat(W - 24)) + p(A.gr + A.b, '│\n'));
+        o(p(A.gr + A.b, `  ├${HR}┤\n`));
+        for (const f of this.lastTools.written) {
+          const badge   = f.isNew ? p(A.gr + A.b, '+new') : p(A.ye + A.b, '~mod');
+          const lineTxt = p(A.gy, `${f.lines} lines`);
+          const pathTxt = p(A.wh + A.b, f.path);
+          o(p(A.gr + A.b, '  │') + `  ${badge}  ${pathTxt}  ${lineTxt}\n`);
+        }
+        o(p(A.gr + A.b, `  ├${HR}┤\n`));
+        o(p(A.gr + A.b, '  │') + p(A.gy, `  ${this.lastTools.written.length} file(s) written • /undo to revert`) + '\n');
+        o(p(A.gr + A.b, `  └${HR}┘\n`));
+        break;
+      }
+
       default:
         o(p(A.re, `  Unknown command: ${p(A.b, cmd)}\n`));
         o(p(A.gy, '  Type /help or press / to see all commands.\n'));
@@ -907,13 +984,14 @@ export default class Chat extends Command {
 
   private _statusLine() {
     const tTag  = this.toolsEnabled ? p(A.gr + A.b, '● tools') : p(A.gy, '○ tools');
+    const pTag  = this.planMode ? p(A.cy + A.b, '  ·  🔒 plan') : '';
     const tok   = p(A.wh, String(this.tokens) + ' tok');
     const cost  = p(A.wh, '$' + this.cost.toFixed(5));
     const model = this.localModelMeta
       ? p(A.cy + A.b, '⚡ ' + this.localModelMeta.name)
       : p(A.gy, this.llm.getModel());
     const localTag = this.localModelMeta ? p(A.cy, '  ·  ') + p(A.cy + A.b, 'local') : '';
-    o('\n' + p(A.gy, '  ╌╌ ') + tok + p(A.gy, '  ·  ') + cost + p(A.gy, '  ·  ') + model + p(A.gy, '  ·  ') + tTag + localTag + '\n');
+    o('\n' + p(A.gy, '  ╌╌ ') + tok + p(A.gy, '  ·  ') + cost + p(A.gy, '  ·  ') + model + p(A.gy, '  ·  ') + tTag + localTag + pTag + '\n');
   }
 
   private _banner() {

@@ -9,18 +9,22 @@
  *
  * Tools available:
  *   read_file      — Read a file's content
- *   write_file     — Write / create a file  ← PRIMARY write tool
+ *   write_file     — Write / create a file
+ *   edit_file      — Surgical search-and-replace editing
  *   list_dir       — List a directory's children
  *   search_files   — Grep-like search across the project
  *   find_symbol    — Find where a class / function is defined
  *   run_command    — Run a safe read-only terminal command
+ *   git_status     — Show git working tree status
+ *   git_diff       — Show git diff of changes
+ *   git_log        — Show recent git commits
  */
 
 import {
   existsSync, readFileSync, readdirSync, statSync,
-  writeFileSync, mkdirSync,
+  writeFileSync, mkdirSync, copyFileSync,
 } from 'fs';
-import { join, resolve, relative, extname, dirname, normalize } from 'path';
+import { join, resolve, relative, extname, dirname } from 'path';
 import { execSync } from 'child_process';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -28,10 +32,14 @@ import { execSync } from 'child_process';
 export type ToolName =
   | 'read_file'
   | 'write_file'
+  | 'edit_file'
   | 'list_dir'
   | 'search_files'
   | 'find_symbol'
-  | 'run_command';
+  | 'run_command'
+  | 'git_status'
+  | 'git_diff'
+  | 'git_log';
 
 /** Metadata for files that were written this session */
 export interface WrittenFile {
@@ -39,6 +47,14 @@ export interface WrittenFile {
   absPath:  string;
   lines:    number;
   isNew:    boolean;  // true = created, false = modified
+}
+
+/** Snapshot of a file before modification (for /undo) */
+export interface FileSnapshot {
+  absPath:  string;
+  relPath:  string;
+  existed:  boolean;
+  content:  string | null;   // null if file didn't exist
 }
 
 export interface ToolCall {
@@ -82,16 +98,35 @@ export class ToolsService {
   /** Tracks all files written this session for the Changes panel */
   public written: WrittenFile[] = [];
 
+  /** Tracks file snapshots for /undo */
+  public snapshots: FileSnapshot[] = [];
+
+  /** Whether this is plan-only mode (no writes) */
+  public planMode: boolean = false;
+
   async execute(call: ToolCall): Promise<ToolResult> {
     const start = Date.now();
     try {
       let output = '';
+
+      // In plan mode, block destructive tools
+      if (this.planMode && ['write_file', 'edit_file', 'run_command'].includes(call.name)) {
+        return {
+          name: call.name, args: call.args,
+          output: '', error: `🔒 Plan mode active — ${call.name} is blocked. Use /plan to toggle off.`,
+          durationMs: Date.now() - start,
+        };
+      }
+
       switch (call.name) {
         case 'read_file':
           output = this.readFile(call.args.path ?? '');
           break;
         case 'write_file':
           output = this.writeFile(call.args.path ?? '', call.args.content ?? '');
+          break;
+        case 'edit_file':
+          output = this.editFile(call.args.path ?? '', call.args.old_content ?? '', call.args.new_content ?? '');
           break;
         case 'list_dir':
           output = this.listDir(call.args.path ?? '.');
@@ -104,6 +139,15 @@ export class ToolsService {
           break;
         case 'run_command':
           output = this.runCommand(call.args.command ?? '');
+          break;
+        case 'git_status':
+          output = this.gitStatus();
+          break;
+        case 'git_diff':
+          output = this.gitDiff(call.args.ref ?? '');
+          break;
+        case 'git_log':
+          output = this.gitLog(call.args.count ?? '10');
           break;
         default:
           output = `Unknown tool: ${call.name}`;
@@ -145,6 +189,9 @@ export class ToolsService {
       return `Blocked: path "${filePath}" would escape the working directory`;
     }
 
+    // ── Snapshot for /undo ──
+    this._snapshot(abs, rel);
+
     const isNew = !existsSync(abs);
     const dir   = dirname(abs);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -155,6 +202,41 @@ export class ToolsService {
     this.written.push({ path: filePath, absPath: abs, lines, isNew });
 
     return `${isNew ? 'Created' : 'Updated'}: ${filePath} (${lines} lines)`;
+  }
+
+  /**
+   * Surgical edit — replaces `old_content` with `new_content` inside a file.
+   * Much safer than write_file for existing files — only changes what's needed.
+   */
+  private editFile(filePath: string, oldContent: string, newContent: string): string {
+    if (!filePath) return 'edit_file requires a path argument';
+    if (!oldContent) return 'edit_file requires an old_content argument (the text to find and replace)';
+
+    const abs = resolve(this.workingDir, filePath);
+    const rel = relative(this.workingDir, abs);
+    if (rel.startsWith('..')) return `Blocked: path traversal outside working directory`;
+    if (!existsSync(abs)) return `File not found: ${filePath}`;
+
+    const original = readFileSync(abs, 'utf-8');
+
+    // Count occurrences
+    const count = original.split(oldContent).length - 1;
+    if (count === 0) {
+      return `edit_file failed: old_content not found in ${filePath}. Make sure your old_content EXACTLY matches the file content (including whitespace).`;
+    }
+
+    // ── Snapshot for /undo ──
+    this._snapshot(abs, rel);
+
+    const updated = original.replace(oldContent, newContent);
+    writeFileSync(abs, updated, 'utf-8');
+
+    const lines = updated.split('\n').length;
+    this.written.push({ path: filePath, absPath: abs, lines, isNew: false });
+
+    const oldLines = oldContent.split('\n').length;
+    const newLines = newContent.split('\n').length;
+    return `Edited: ${filePath} — replaced ${oldLines} line(s) with ${newLines} line(s)${count > 1 ? ` (first of ${count} occurrences)` : ''}`;
   }
 
   private listDir(dirPath: string): string {
@@ -241,7 +323,6 @@ export class ToolsService {
 
   private findSymbol(symbol: string): string {
     if (!symbol) return 'find_symbol requires a symbol argument';
-    // Reuse search with a common definition pattern
     const patterns = [
       `class\\s+${symbol}\\b`,
       `function\\s+${symbol}\\b`,
@@ -283,6 +364,77 @@ export class ToolsService {
     }
   }
 
+  // ─── Git tools ──────────────────────────────────────────────────────────
+
+  private gitStatus(): string {
+    try {
+      return execSync('git status --short', {
+        cwd: this.workingDir, encoding: 'utf-8', timeout: 5000,
+      }) || '(clean working tree)';
+    } catch (e: any) {
+      return `git status failed: ${e.message}`;
+    }
+  }
+
+  private gitDiff(ref: string): string {
+    try {
+      const cmd = ref ? `git diff ${ref}` : 'git diff';
+      const output = execSync(cmd, {
+        cwd: this.workingDir, encoding: 'utf-8', timeout: 10000,
+      });
+      return (output || '(no changes)').slice(0, this.MAX_CMD_OUTPUT);
+    } catch (e: any) {
+      return `git diff failed: ${e.message}`;
+    }
+  }
+
+  private gitLog(count: string): string {
+    try {
+      const n = Math.min(parseInt(count) || 10, 30);
+      return execSync(`git log --oneline -n ${n}`, {
+        cwd: this.workingDir, encoding: 'utf-8', timeout: 5000,
+      }) || '(no commits)';
+    } catch (e: any) {
+      return `git log failed: ${e.message}`;
+    }
+  }
+
+  // ─── Snapshot / Undo ──────────────────────────────────────────────────────
+
+  /** Save a snapshot of a file before modifying it */
+  private _snapshot(abs: string, rel: string) {
+    // Only snapshot once per file per session
+    if (this.snapshots.some(s => s.absPath === abs)) return;
+    const existed = existsSync(abs);
+    this.snapshots.push({
+      absPath: abs,
+      relPath: rel,
+      existed,
+      content: existed ? readFileSync(abs, 'utf-8') : null,
+    });
+  }
+
+  /** Restore all files to their pre-edit state */
+  undoAll(): string[] {
+    const restored: string[] = [];
+    for (const snap of this.snapshots) {
+      if (snap.existed && snap.content !== null) {
+        writeFileSync(snap.absPath, snap.content, 'utf-8');
+        restored.push(`↩ Restored: ${snap.relPath}`);
+      } else if (!snap.existed && existsSync(snap.absPath)) {
+        // File was newly created — delete it
+        try {
+          const { unlinkSync } = require('fs');
+          unlinkSync(snap.absPath);
+          restored.push(`🗑 Deleted (was new): ${snap.relPath}`);
+        } catch { /* skip */ }
+      }
+    }
+    this.snapshots = [];
+    this.written   = [];
+    return restored;
+  }
+
   // ─── Static helpers ───────────────────────────────────────────────────────
 
   /**
@@ -315,21 +467,48 @@ export class ToolsService {
   }
 
   /**
+   * Read OPTIMUS.md project context if it exists.
+   * Checks for: OPTIMUS.md, optimus.md, .optimus.md
+   */
+  static readProjectContext(workingDir: string): string | null {
+    const candidates = ['OPTIMUS.md', 'optimus.md', '.optimus.md'];
+    for (const name of candidates) {
+      const p = join(workingDir, name);
+      if (existsSync(p)) {
+        try {
+          const content = readFileSync(p, 'utf-8');
+          return content.slice(0, 4000); // cap at 4K to save context
+        } catch { /* skip */ }
+      }
+    }
+    return null;
+  }
+
+  /**
    * The system-prompt section that teaches the LLM how to call tools.
    * This is injected as the system message in every chat turn.
    */
-  static toolsSystemSection(): string {
+  static toolsSystemSection(projectContext?: string | null, planMode = false): string {
+    const planNote = planMode
+      ? `\n\n## ⚠️ PLAN MODE ACTIVE\nYou are in READ-ONLY plan mode. You can use read_file, list_dir, search_files, find_symbol, git_status, git_diff, git_log.\nYou CANNOT use write_file, edit_file, or run_command.\nAnalyze the codebase and create a detailed implementation plan for the user's request.\n`
+      : '';
+
+    const contextBlock = projectContext
+      ? `\n\n## Project Context (from OPTIMUS.md)\n${projectContext}\n`
+      : '';
+
     return `
 You are Optimus — an expert AI coding agent. You have tools to read AND write files directly.
-
+${contextBlock}${planNote}
 ## CRITICAL BEHAVIOUR
 
 When the user asks you to CREATE, MODIFY, or FIX code:
 1. Use list_dir / read_file to understand the project structure first
-2. Use write_file to write EVERY file — do NOT just show code in your reply
-3. After writing all files, give a SHORT plain-English summary of what you did
+2. For EXISTING files, prefer edit_file (surgical replace) over write_file (full overwrite)
+3. Use write_file only for NEW files
+4. After writing/editing all files, give a SHORT plain-English summary of what you did
 
-Do NOT output raw code blocks in your reply when write_file can do the job.
+Do NOT output raw code blocks in your reply when edit_file/write_file can do the job.
 Do NOT ask for permission to write files — just do it.
 
 ## Tool call format (use EXACTLY):
@@ -339,25 +518,25 @@ Do NOT ask for permission to write files — just do it.
 ## Available tools:
 
 | Tool | Args | Description |
-|------|------|---------|
+|------|------|---------
 | list_dir | path: string | Show directory tree |
 | read_file | path: string | Read a file |
-| write_file | path: string, content: string | Create or overwrite a file |
+| write_file | path: string, content: string | Create or overwrite a file (use for NEW files) |
+| edit_file | path: string, old_content: string, new_content: string | Replace specific content in a file (preferred for edits) |
 | search_files | pattern: string, glob?: string | Grep across project |
 | find_symbol | symbol: string | Locate a class/function definition |
 | run_command | command: string | Run a safe read-only terminal command |
+| git_status | (none) | Show git working tree status |
+| git_diff | ref?: string | Show git diff (optionally from a ref) |
+| git_log | count?: string | Show recent git commits |
 
-## Example workflow for "create an Express server":
+## edit_file — how to use:
 
-<use_tool><name>list_dir</name><args>{"path": "."}</args></use_tool>
+edit_file replaces the FIRST occurrence of old_content with new_content.
+old_content must EXACTLY match part of the file (including whitespace/indentation).
 
-... (receives directory listing) ...
-
-<use_tool><name>write_file</name><args>{"path": "server.ts", "content": "import express...\n"}</args></use_tool>
-<use_tool><name>write_file</name><args>{"path": "controllers/hello.ts", "content": "..."}</args></use_tool>
-<use_tool><name>write_file</name><args>{"path": "middleware/logger.ts", "content": "..."}</args></use_tool>
-
-Done! Created 3 files: server.ts, controllers/hello.ts, middleware/logger.ts
+Example:
+<use_tool><name>edit_file</name><args>{"path": "src/app.ts", "old_content": "const port = 3000;", "new_content": "const port = process.env.PORT || 3000;"}</args></use_tool>
 `.trim();
   }
 }

@@ -2,6 +2,7 @@
  * Local Model Service
  * Handles interactions with local models running on localhost, ngrok, cloudflare, or other tunneling services
  * Supports Ollama, OpenAI-compatible, and generic HTTP endpoints
+ * NOW WITH STREAMING — tokens appear as they are generated
  */
 
 import type { LocalModel, LocalModelTestResult, LocalModelResponse } from '../types/local-model.js';
@@ -14,339 +15,233 @@ export interface LLMStreamCallback {
 
 export class LocalModelService {
   private model: LocalModel;
-  private testTimeout: number = 30000;       // 30s for probes/tests
-  private completionTimeout: number = 300000; // 5 min for actual completions
+  private testTimeout: number = 15000;        // 15s for probes/tests
+  private completionTimeout: number = 300000;  // 5 min for actual completions
 
   constructor(model: LocalModel) {
     this.model = model;
   }
 
-  /**
-   * Test if the local model endpoint is accessible and working
-   */
+  // ─── Test helpers ─────────────────────────────────────────────────────────
+
   async testEndpoint(): Promise<LocalModelTestResult> {
     try {
       const startTime = Date.now();
-
-      if (this.model.type === 'ollama') {
-        return await this.testOllamaEndpoint(startTime);
-      } else if (this.model.type === 'openai-compatible') {
-        return await this.testOpenAICompatibleEndpoint(startTime);
-      } else {
-        return await this.testGenericEndpoint(startTime);
-      }
+      if (this.model.type === 'ollama') return this.testOllamaEndpoint(startTime);
+      if (this.model.type === 'openai-compatible') return this.testOpenAIEndpoint(startTime);
+      return this.testGenericEndpoint(startTime);
     } catch (error) {
-      return {
-        success: false,
-        message: `Endpoint test failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
+      return { success: false, message: `Endpoint test failed: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
-  /**
-   * Test Ollama endpoint
-   */
-  private async testOllamaEndpoint(startTime: number): Promise<LocalModelTestResult> {
+  private async testOllamaEndpoint(t0: number): Promise<LocalModelTestResult> {
     try {
-      const response = await fetch(`${this.model.endpoint}/api/tags`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(this.completionTimeout),
-      });
-
-      if (!response.ok) {
-        return {
-          success: false,
-          message: `Ollama endpoint returned status ${response.status}`,
-        };
-      }
-
-      const data = await response.json() as any;
-      const latency = Date.now() - startTime;
-
+      const r = await fetch(`${this.model.endpoint}/api/tags`, { method: 'GET', signal: AbortSignal.timeout(this.testTimeout) });
+      if (!r.ok) return { success: false, message: `Ollama returned ${r.status}` };
+      const data = await r.json() as any;
       const models: any[] = data.models || [];
-      const modelName = this.model.model || 'unknown';
-      const modelExists = models.some((m: any) => m.name === modelName || m.name.startsWith(modelName));
-
-      if (!modelExists && models.length > 0) {
-        return {
-          success: true,
-          message: `Ollama endpoint is working. Available models: ${models.map((m: any) => m.name).join(', ')}`,
-          latency,
-          modelInfo: {
-            name: 'Ollama',
-            capabilities: ['chat', 'completion'],
-          },
-        };
-      }
-
       return {
-        success: true,
-        message: `Ollama endpoint is working with model '${modelName}'`,
-        latency,
-        modelInfo: {
-          name: 'Ollama',
-          capabilities: ['chat', 'completion'],
-        },
+        success: true, latency: Date.now() - t0,
+        message: `Ollama OK — models: ${models.map((m: any) => m.name).join(', ') || 'none'}`,
+        modelInfo: { name: 'Ollama', capabilities: ['chat', 'completion', 'streaming'] },
       };
-    } catch (error) {
-      return {
-        success: false,
-        message: `Failed to connect to Ollama endpoint: ${error instanceof Error ? error.message : String(error)}`,
-      };
+    } catch (e) {
+      return { success: false, message: `Ollama unreachable: ${e instanceof Error ? e.message : e}` };
     }
   }
 
-  /**
-   * Test OpenAI-compatible endpoint
-   */
-  private async testOpenAICompatibleEndpoint(startTime: number): Promise<LocalModelTestResult> {
+  private async testOpenAIEndpoint(t0: number): Promise<LocalModelTestResult> {
     try {
-      const messages = [{ role: 'user', content: 'Hello' }];
-      const modelName = this.model.model || 'default';
-
-      const response = await fetch(`${this.model.endpoint}/v1/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(this.model.apiKey && { Authorization: `Bearer ${this.model.apiKey}` }),
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages,
-          max_tokens: 10,
-          temperature: 0.7,
-        }),
-        signal: AbortSignal.timeout(this.completionTimeout),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({})) as any;
-        return {
-          success: false,
-          message: `OpenAI-compatible endpoint returned status ${response.status}: ${errorData.error?.message || 'Unknown error'}`,
-        };
-      }
-
-      const latency = Date.now() - startTime;
-
+      const r = await fetch(`${this.model.endpoint}/v1/models`, { method: 'GET', signal: AbortSignal.timeout(this.testTimeout) });
+      if (!r.ok) return { success: false, message: `OpenAI-compatible returned ${r.status}` };
       return {
-        success: true,
-        message: `OpenAI-compatible endpoint is working with model '${modelName}'`,
-        latency,
-        modelInfo: {
-          name: modelName,
-          capabilities: ['chat', 'completion'],
-        },
+        success: true, latency: Date.now() - t0,
+        message: `OpenAI-compatible endpoint OK`,
+        modelInfo: { name: this.model.model || 'default', capabilities: ['chat', 'completion', 'streaming'] },
       };
-    } catch (error) {
-      return {
-        success: false,
-        message: `Failed to connect to OpenAI-compatible endpoint: ${error instanceof Error ? error.message : String(error)}`,
-      };
+    } catch (e) {
+      return { success: false, message: `OpenAI-compatible unreachable: ${e instanceof Error ? e.message : e}` };
     }
   }
 
-  /**
-   * Test generic HTTP endpoint
-   */
-  private async testGenericEndpoint(startTime: number): Promise<LocalModelTestResult> {
+  private async testGenericEndpoint(t0: number): Promise<LocalModelTestResult> {
     try {
-      const response = await fetch(this.model.endpoint, {
-        method: 'GET',
-        signal: AbortSignal.timeout(this.completionTimeout),
-      });
-
-      const latency = Date.now() - startTime;
-
-      if (response.ok) {
-        return {
-          success: true,
-          message: `Generic endpoint is accessible`,
-          latency,
-        };
-      } else {
-        return {
-          success: false,
-          message: `Generic endpoint returned status ${response.status}`,
-        };
-      }
-    } catch (error) {
-      return {
-        success: false,
-        message: `Failed to connect to generic endpoint: ${error instanceof Error ? error.message : String(error)}`,
-      };
+      const r = await fetch(this.model.endpoint, { method: 'GET', signal: AbortSignal.timeout(this.testTimeout) });
+      return r.ok
+        ? { success: true, latency: Date.now() - t0, message: 'Endpoint accessible' }
+        : { success: false, message: `Endpoint returned ${r.status}` };
+    } catch (e) {
+      return { success: false, message: `Unreachable: ${e instanceof Error ? e.message : e}` };
     }
   }
 
-  /**
-   * Send a message to the local model
-   */
-  async complete(
-    message: string,
-    systemPrompt?: string,
-    callbacks?: LLMStreamCallback
-  ): Promise<LocalModelResponse> {
-    const messages: Array<{ role: string; content: string }> = [];
+  // ─── Completion (public API) ──────────────────────────────────────────────
 
-    if (systemPrompt) {
-      messages.push({ role: 'system', content: systemPrompt });
-    }
-
-    messages.push({ role: 'user', content: message });
-
-    return this.completeWithHistory(messages, callbacks);
+  async complete(message: string, systemPrompt?: string, callbacks?: LLMStreamCallback): Promise<LocalModelResponse> {
+    const msgs: Array<{ role: string; content: string }> = [];
+    if (systemPrompt) msgs.push({ role: 'system', content: systemPrompt });
+    msgs.push({ role: 'user', content: message });
+    return this.completeWithHistory(msgs, callbacks);
   }
 
-  /**
-   * Send a full message history to the local model
-   */
   async completeWithHistory(
     messages: Array<{ role: string; content: string }>,
-    callbacks?: LLMStreamCallback
+    callbacks?: LLMStreamCallback,
   ): Promise<LocalModelResponse> {
     try {
-      if (this.model.type === 'ollama') {
-        return await this.completeOllama(messages, callbacks);
-      } else if (this.model.type === 'openai-compatible') {
-        return await this.completeOpenAICompatible(messages, callbacks);
-      } else {
-        throw new Error(`Unsupported local model type: ${this.model.type}`);
-      }
+      if (this.model.type === 'ollama') return await this.streamOllama(messages, callbacks);
+      return await this.streamOpenAI(messages, callbacks);
     } catch (error) {
-      if (callbacks?.onError) {
-        callbacks.onError(error as Error);
-      }
+      callbacks?.onError?.(error as Error);
       throw error;
     }
   }
 
-  /**
-   * Complete with Ollama endpoint
-   */
-  private async completeOllama(
+  // ─── Ollama streaming ───────────────────────────────────────────────────
+
+  private async streamOllama(
     messages: Array<{ role: string; content: string }>,
-    callbacks?: LLMStreamCallback
+    callbacks?: LLMStreamCallback,
   ): Promise<LocalModelResponse> {
     const modelName = this.model.model || 'llama2';
 
-    try {
-      const response = await fetch(`${this.model.endpoint}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages,
-          stream: false,
-          temperature: 0.7,
-        }),
-        signal: AbortSignal.timeout(this.completionTimeout),
-      });
+    const response = await fetch(`${this.model.endpoint}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelName, messages, stream: true, temperature: 0.7 }),
+      signal: AbortSignal.timeout(this.completionTimeout),
+    });
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({})) as any;
-        throw new Error(`Ollama API error: ${errorData.error || response.statusText}`);
-      }
-
-      const data = await response.json() as any;
-      const content: string = data.message?.content || '';
-
-      if (callbacks?.onChunk) {
-        callbacks.onChunk(content);
-      }
-
-      const result: LocalModelResponse = {
-        content,
-        model: modelName,
-        tokensUsed: {
-          input: data.prompt_eval_count || 0,
-          output: data.eval_count || 0,
-          total: (data.prompt_eval_count || 0) + (data.eval_count || 0),
-        },
-      };
-
-      if (callbacks?.onComplete) {
-        callbacks.onComplete(result);
-      }
-
-      return result;
-    } catch (error) {
-      throw new Error(`Ollama completion failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({})) as any;
+      throw new Error(`Ollama API error: ${err.error || response.statusText}`);
     }
+
+    // Ollama streams NDJSON lines — each is a JSON object with message.content
+    let fullContent = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('No response body from Ollama');
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';  // keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const chunk = JSON.parse(trimmed) as any;
+            const token = chunk.message?.content || '';
+            if (token) {
+              fullContent += token;
+              callbacks?.onChunk?.(token);
+            }
+            // Final message has done: true with eval counts
+            if (chunk.done) {
+              inputTokens = chunk.prompt_eval_count || 0;
+              outputTokens = chunk.eval_count || 0;
+            }
+          } catch { /* skip malformed JSON */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const result: LocalModelResponse = {
+      content: fullContent,
+      model: modelName,
+      tokensUsed: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens },
+    };
+    callbacks?.onComplete?.(result);
+    return result;
   }
 
-  /**
-   * Complete with OpenAI-compatible endpoint
-   */
-  private async completeOpenAICompatible(
+  // ─── OpenAI-compatible streaming ──────────────────────────────────────────
+
+  private async streamOpenAI(
     messages: Array<{ role: string; content: string }>,
-    callbacks?: LLMStreamCallback
+    callbacks?: LLMStreamCallback,
   ): Promise<LocalModelResponse> {
     const modelName = this.model.model || 'default';
 
-    try {
-      const response = await fetch(`${this.model.endpoint}/v1/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(this.model.apiKey && { Authorization: `Bearer ${this.model.apiKey}` }),
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages,
-          temperature: 0.7,
-          max_tokens: 2000,
-          stream: false,
-        }),
-        signal: AbortSignal.timeout(this.completionTimeout),
-      });
+    const response = await fetch(`${this.model.endpoint}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(this.model.apiKey && { Authorization: `Bearer ${this.model.apiKey}` }),
+      },
+      body: JSON.stringify({
+        model: modelName, messages,
+        temperature: 0.7, max_tokens: 4096,
+        stream: true,
+      }),
+      signal: AbortSignal.timeout(this.completionTimeout),
+    });
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({})) as any;
-        throw new Error(`OpenAI-compatible API error: ${errorData.error?.message || response.statusText}`);
-      }
-
-      const data = await response.json() as any;
-      const content: string = data.choices?.[0]?.message?.content || '';
-      const inputTokens: number = data.usage?.prompt_tokens || 0;
-      const outputTokens: number = data.usage?.completion_tokens || 0;
-
-      if (callbacks?.onChunk) {
-        callbacks.onChunk(content);
-      }
-
-      const result: LocalModelResponse = {
-        content,
-        model: modelName,
-        tokensUsed: {
-          input: inputTokens,
-          output: outputTokens,
-          total: inputTokens + outputTokens,
-        },
-      };
-
-      if (callbacks?.onComplete) {
-        callbacks.onComplete(result);
-      }
-
-      return result;
-    } catch (error) {
-      throw new Error(`OpenAI-compatible completion failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({})) as any;
+      throw new Error(`OpenAI API error: ${err.error?.message || response.statusText}`);
     }
+
+    let fullContent = '';
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('No response body');
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const data = trimmed.slice(6);
+          if (data === '[DONE]') break;
+          try {
+            const chunk = JSON.parse(data) as any;
+            const token = chunk.choices?.[0]?.delta?.content || '';
+            if (token) {
+              fullContent += token;
+              callbacks?.onChunk?.(token);
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const result: LocalModelResponse = {
+      content: fullContent,
+      model: modelName,
+      tokensUsed: { input: 0, output: 0, total: 0 },  // SSE doesn't always include usage
+    };
+    callbacks?.onComplete?.(result);
+    return result;
   }
 
-  /**
-   * Get the model information
-   */
-  getModel(): LocalModel {
-    return this.model;
-  }
+  // ─── Accessors ──────────────────────────────────────────────────────────
 
-  /**
-   * Get model name
-   */
-  getModelName(): string {
-    return this.model.model || this.model.name;
-  }
+  getModel(): LocalModel { return this.model; }
+  getModelName(): string { return this.model.model || this.model.name; }
 }
