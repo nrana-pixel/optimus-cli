@@ -4,6 +4,8 @@ import { LLMServiceLiteLLM } from '../services/llm-litellm.service.js';
 import { ConfigService } from '../services/config.service.js';
 import { ConversationService } from '../services/conversation.service.js';
 import { ToolsService } from '../services/tools.service.js';
+import { LocalModelService } from '../services/local-model.service.js';
+import type { LocalModel } from '../types/local-model.js';
 import { resolve } from 'path';
 
 // ─── ANSI / terminal helpers ─────────────────────────────────────────────────
@@ -37,16 +39,18 @@ const esc = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');  // strip AN
 // ─── Command registry ────────────────────────────────────────────────────────
 
 const CMDS = [
-  { cmd: '/help',     args: '',           desc: 'Show this command list'                    },
-  { cmd: '/clear',    args: '',           desc: 'Clear chat history'                        },
-  { cmd: '/history',  args: '',           desc: 'Print conversation so far'                 },
-  { cmd: '/model',    args: '[name]',     desc: 'Show or change model  e.g. /model gpt-4o' },
-  { cmd: '/tools',    args: '',           desc: 'Toggle tool use on/off'                    },
-  { cmd: '/cost',     args: '',           desc: 'Show tokens + estimated cost'              },
-  { cmd: '/save',     args: '',           desc: 'Force-save session to disk'                },
-  { cmd: '/sessions', args: '',           desc: 'List saved sessions'                       },
-  { cmd: '/config',   args: '',           desc: 'Show current API config'                   },
-  { cmd: '/exit',     args: '',           desc: 'Quit (also Ctrl+C)'                        },
+  { cmd: '/help',       args: '',           desc: 'Show this command list'                         },
+  { cmd: '/clear',      args: '',           desc: 'Clear chat history'                             },
+  { cmd: '/history',    args: '',           desc: 'Print conversation so far'                      },
+  { cmd: '/model',      args: '[name]',     desc: 'Show or change model  e.g. /model gpt-4o'      },
+  { cmd: '/connect',    args: '<url>',      desc: 'Connect to a local/Colab model endpoint'        },
+  { cmd: '/disconnect', args: '',           desc: 'Disconnect from local model, use cloud again'   },
+  { cmd: '/tools',      args: '',           desc: 'Toggle tool use on/off'                         },
+  { cmd: '/cost',       args: '',           desc: 'Show tokens + estimated cost'                   },
+  { cmd: '/save',       args: '',           desc: 'Force-save session to disk'                     },
+  { cmd: '/sessions',   args: '',           desc: 'List saved sessions'                            },
+  { cmd: '/config',     args: '',           desc: 'Show current API config'                        },
+  { cmd: '/exit',       args: '',           desc: 'Quit (also Ctrl+C)'                             },
 ];
 
 // ─── Spinner ─────────────────────────────────────────────────────────────────
@@ -198,10 +202,21 @@ class Prompt {
   /** Update dropdown filter based on current buf */
   private _updateDropdown() {
     if (this.buf.startsWith('/')) {
-      this.ddItems = CMDS.filter(c => c.cmd.startsWith(this.buf.split(' ')[0]));
-      this.ddOpen  = this.ddItems.length > 0;
-      // Clamp selection
-      if (this.ddSel >= this.ddItems.length) this.ddSel = 0;
+      const parts = this.buf.split(' ');
+      const typed = parts[0];
+      const hasArgs = parts.length > 1; // user typed a space → entering arguments
+
+      // If the typed command exactly matches one entry and user is entering args, close dropdown
+      const exactMatch = CMDS.some(c => c.cmd === typed);
+      if (exactMatch && hasArgs) {
+        this.ddOpen  = false;
+        this.ddItems = [];
+        this.ddSel   = 0;
+      } else {
+        this.ddItems = CMDS.filter(c => c.cmd.startsWith(typed));
+        this.ddOpen  = this.ddItems.length > 0;
+        if (this.ddSel >= this.ddItems.length) this.ddSel = 0;
+      }
     } else {
       this.ddOpen  = false;
       this.ddItems = [];
@@ -386,6 +401,10 @@ export default class Chat extends Command {
   private cost   = 0;
   private sessName = '';
 
+  // ── Local model connection state ─────────────────────────────────────────────
+  private localModelService: LocalModelService | null = null;
+  private localModelMeta: LocalModel | null = null;
+
   async run() {
     const { flags } = await this.parse(Chat);
     this.llm = new LLMServiceLiteLLM();
@@ -423,10 +442,46 @@ export default class Chat extends Command {
     let fullFinal = '';
     let started   = false;
 
-    const firstContent = (label = 'Optimus') => {
-      if (!started) { started = true; spinner.stop(label); }
+    const modelLabel = this.localModelMeta
+      ? this.localModelMeta.name
+      : 'Optimus';
+
+    const firstContent = (label?: string) => {
+      if (!started) { started = true; spinner.stop(label ?? modelLabel); }
     };
 
+    // ── Route through LOCAL model if connected ──────────────────────────────
+    if (this.localModelService) {
+      try {
+        const svc = this.localModelService;
+        const res = await svc.completeWithHistory(this.msgs, {
+          onChunk:    (chunk) => { firstContent(); o(chunk); fullFinal += chunk; },
+          onError:    (err)   => { firstContent(); o(p(A.re, `\n  ⚠  ${err.message}`)); },
+          onComplete: (r)     => {
+            if (!fullFinal) fullFinal = r.content;
+            if (r.tokensUsed) this.tokens += r.tokensUsed.total;
+          },
+        });
+        if (!fullFinal) {
+          fullFinal = res.content;
+          firstContent();
+          o(fullFinal);
+        }
+        o('\n');
+        this.msgs.push({ role: 'assistant', content: fullFinal });
+        this.conv.addMessage('assistant', fullFinal);
+        this.conv.updateMetadata(0, 0);
+        this.conv.saveSession();
+        this._statusLine();
+      } catch (e: any) {
+        firstContent();
+        o('\n' + p(A.re, `  ⚠  ${e.message}\n`));
+      }
+      o('\n');
+      return;
+    }
+
+    // ── Cloud LLM path ──────────────────────────────────────────────────────
     try {
       const systemMsg = this.toolsEnabled
         ? [{ role: 'system', content: ToolsService.toolsSystemSection() }]
@@ -696,6 +751,151 @@ export default class Chat extends Command {
         break;
       }
 
+      // /connect ───────────────────────────────────────────────────
+      case '/connect': {
+        const rawUrl = rest.join(' ').trim();
+        if (!rawUrl) {
+          o(p(A.re, '  ⚠  Usage: /connect <url>\n'));
+          o(p(A.gy, '  Examples:\n'));
+          o(p(A.gy, '    /connect http://localhost:11434                        (Ollama local)\n'));
+          o(p(A.gy, '    /connect http://localhost:8000                         (OpenAI-compatible, e.g. LM Studio)\n'));
+          o(p(A.gy, '    /connect https://xxxx.ngrok-free.app                  (ngrok tunnel)\n'));
+          o(p(A.gy, '    /connect https://xxxx.trycloudflare.com               (Cloudflare tunnel)\n'));
+          o(p(A.gy, '    /connect https://xxxx-free.colab.research.google.com  (Google Colab)\n'));
+          break;
+        }
+
+        // Normalise URL — strip trailing slash
+        const endpoint = rawUrl.replace(/\/$/, '');
+
+        // ── Auto-detect tunnel type ───────────────────────────────────────────
+        let modelType: LocalModel['type'] = 'openai-compatible';
+        let tunnelType: LocalModel['tunnelType'] = 'other';
+        let modelName = 'default';
+        let displayName = 'Local Model';
+        let connected = false;
+        let latencyMs = 0;
+
+        if (endpoint.includes('localhost') || endpoint.includes('127.0.0.1')) {
+          tunnelType = 'localhost';
+        } else if (endpoint.includes('ngrok')) {
+          tunnelType = 'ngrok';
+        } else if (endpoint.includes('trycloudflare') || endpoint.includes('cloudflare.dev')) {
+          tunnelType = 'cloudflare';
+        } else if (endpoint.includes('colab') || endpoint.includes('gradio')) {
+          tunnelType = 'other';
+        }
+
+        // ── Single spinner for whole detection phase ──────────────────────────
+        const detectSpinner = new Spinner('Connecting');
+        detectSpinner.start();
+        const t0 = Date.now();
+
+        // 1. Probe Ollama (GET /api/tags)
+        try {
+          const res = await fetch(`${endpoint}/api/tags`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(6000),
+          });
+          if (res.ok) {
+            const data = await res.json() as any;
+            modelType = 'ollama';
+            const mods: any[] = data.models || [];
+            modelName   = (Array.isArray(mods) && mods.length > 0) ? (mods[0].name || 'llama2') : 'llama2';
+            displayName = `Ollama (${modelName})`;
+            latencyMs   = Date.now() - t0;
+            connected   = true;
+          }
+        } catch { /* not Ollama */ }
+
+        // 2. Probe OpenAI-compatible (/v1/models)
+        if (!connected) {
+          try {
+            const res = await fetch(`${endpoint}/v1/models`, {
+              method: 'GET',
+              signal: AbortSignal.timeout(6000),
+            });
+            if (res.ok) {
+              const data = await res.json() as any;
+              const mods: any[] = data.data || [];
+              modelName   = mods.length > 0 ? (mods[0].id || 'default') : 'default';
+              displayName = `OpenAI-compatible (${modelName})`;
+              latencyMs   = Date.now() - t0;
+              connected   = true;
+            }
+          } catch { /* fall through */ }
+        }
+
+        // 3. Generic fallback — just ping the base URL
+        if (!connected) {
+          try {
+            const res = await fetch(endpoint, { method: 'GET', signal: AbortSignal.timeout(6000) });
+            if (res.ok) {
+              displayName = 'OpenAI-compatible (generic)';
+              latencyMs   = Date.now() - t0;
+              connected   = true;
+            }
+          } catch (err) {
+            detectSpinner.stop('Optimus');
+            o('\n');
+            o(p(A.re, `  ✖ Cannot reach ${p(A.wh, endpoint)}\n`));
+            o(p(A.gy, `     ${err instanceof Error ? err.message : String(err)}\n`));
+            o(p(A.gy, '  Make sure your model server is running and the URL is correct.\n'));
+            break;
+          }
+        }
+
+        detectSpinner.stop('Optimus');
+        o('\n');
+
+        if (!connected) {
+          o(p(A.re, `  ✖ No model server responded at ${p(A.wh, endpoint)}\n`));
+          o(p(A.gy, '  Ensure Ollama, LM Studio, or an OpenAI-compatible server is running.\n'));
+          break;
+        }
+
+        // ── Build + activate ──────────────────────────────────────────────────
+        const localModel: LocalModel = {
+          id:          `local-${Date.now()}`,
+          name:        displayName,
+          endpoint,
+          type:        modelType,
+          model:       modelName,
+          tunnelType,
+          createdAt:   new Date().toISOString(),
+          isHealthy:   true,
+          lastTested:  new Date().toISOString(),
+        };
+
+        try { ConfigService.addLocalModel(localModel); } catch { /* best-effort */ }
+
+        this.localModelService = new LocalModelService(localModel);
+        this.localModelMeta    = localModel;
+
+        const latStr = latencyMs > 0 ? p(A.gy, ` (${latencyMs}ms)`) : '';
+        o(p(A.gr + A.b, '  ✔ Connected!') + latStr + '\n\n');
+        o(p(A.mg + A.b, '  ⚡ Now chatting with : ') + p(A.cy + A.b, displayName) + '\n');
+        o(p(A.gy,       '     Endpoint         : ') + p(A.wh, endpoint) + '\n');
+        o(p(A.gy,       '     Type             : ') + p(A.wh, modelType) + '\n');
+        o(p(A.gy,       '     Model            : ') + p(A.wh, modelName) + '\n');
+        o(p(A.gy, '  Use /disconnect to switch back to the cloud provider.\n'));
+        break;
+      }
+
+      // /disconnect ────────────────────────────────────────────────
+      case '/disconnect': {
+        if (!this.localModelService) {
+          o(p(A.ye, '  ⚡ No local model is currently connected.\n'));
+          break;
+        }
+        const prevName = this.localModelMeta?.name ?? 'local model';
+        this.localModelService = null;
+        this.localModelMeta    = null;
+        o(p(A.gr, `  ✔ Disconnected from ${p(A.cy + A.b, prevName)}.\n`));
+        o(p(A.gy,  `  Resuming cloud provider: `) + p(A.cy + A.b, this.llm.getModel()) + '\n');
+        break;
+      }
+
       default:
         o(p(A.re, `  Unknown command: ${p(A.b, cmd)}\n`));
         o(p(A.gy, '  Type /help or press / to see all commands.\n'));
@@ -709,8 +909,11 @@ export default class Chat extends Command {
     const tTag  = this.toolsEnabled ? p(A.gr + A.b, '● tools') : p(A.gy, '○ tools');
     const tok   = p(A.wh, String(this.tokens) + ' tok');
     const cost  = p(A.wh, '$' + this.cost.toFixed(5));
-    const model = p(A.gy, this.llm.getModel());
-    o('\n' + p(A.gy, '  ╌╌ ') + tok + p(A.gy, '  ·  ') + cost + p(A.gy, '  ·  ') + model + p(A.gy, '  ·  ') + tTag + '\n');
+    const model = this.localModelMeta
+      ? p(A.cy + A.b, '⚡ ' + this.localModelMeta.name)
+      : p(A.gy, this.llm.getModel());
+    const localTag = this.localModelMeta ? p(A.cy, '  ·  ') + p(A.cy + A.b, 'local') : '';
+    o('\n' + p(A.gy, '  ╌╌ ') + tok + p(A.gy, '  ·  ') + cost + p(A.gy, '  ·  ') + model + p(A.gy, '  ·  ') + tTag + localTag + '\n');
   }
 
   private _banner() {

@@ -1,1 +1,53 @@
-/**\n * Local Model Type Definitions\n * Supports local models running on localhost, ngrok, cloudflare, or other tunneling services\n */\n\nexport interface LocalModel {\n  id: string;                    // Unique identifier (e.g., 'ollama-llama2')\n  name: string;                  // Display name (e.g., 'Ollama Llama 2')\n  endpoint: string;              // Full URL to the model endpoint\n  type: 'ollama' | 'openai-compatible' | 'generic'; // API type\n  model?: string;                // Model name/ID on the endpoint (e.g., 'llama2')\n  apiKey?: string;               // Optional API key for authentication\n  description?: string;          // User-friendly description\n  createdAt: string;             // ISO timestamp\n  lastTested?: string;           // ISO timestamp of last successful test\n  isHealthy?: boolean;           // Last known health status\n  tunnelType?: 'ngrok' | 'cloudflare' | 'localhost' | 'other'; // How it's exposed\n}\n\nexport interface LocalModelConfig {\n  models: LocalModel[];\n  defaultLocalModel?: string;    // ID of default local model\n}\n\nexport interface LocalModelTestResult {\n  success: boolean;\n  message: string;\n  latency?: number;              // Response time in ms\n  modelInfo?: {\n    name?: string;\n    version?: string;\n    capabilities?: string[];\n  };\n}\n\nexport interface LocalModelRequest {\n  messages: Array<{ role: string; content: string }>;\n  model?: string;\n  temperature?: number;\n  max_tokens?: number;\n  stream?: boolean;\n}\n\nexport interface LocalModelResponse {\n  content: string;\n  model: string;\n  tokensUsed?: {\n    input: number;\n    output: number;\n    total: number;\n  };\n  stopReason?: string;\n}\n"
+/**
+ * Local Model Type Definitions
+ * Supports local models running on localhost, ngrok, cloudflare, or other tunneling services
+ */
+
+export interface LocalModel {
+  id: string;                    // Unique identifier (e.g., 'ollama-llama2')
+  name: string;                  // Display name (e.g., 'Ollama Llama 2')
+  endpoint: string;              // Full URL to the model endpoint
+  type: 'ollama' | 'openai-compatible' | 'generic'; // API type
+  model?: string;                // Model name/ID on the endpoint (e.g., 'llama2')
+  apiKey?: string;               // Optional API key for authentication
+  description?: string;          // User-friendly description
+  createdAt: string;             // ISO timestamp
+  lastTested?: string;           // ISO timestamp of last successful test
+  isHealthy?: boolean;           // Last known health status
+  tunnelType?: 'ngrok' | 'cloudflare' | 'localhost' | 'other'; // How it's exposed
+}
+
+export interface LocalModelConfig {
+  models: LocalModel[];
+  defaultLocalModel?: string;    // ID of default local model
+}
+
+export interface LocalModelTestResult {
+  success: boolean;
+  message: string;
+  latency?: number;              // Response time in ms
+  modelInfo?: {
+    name?: string;
+    version?: string;
+    capabilities?: string[];
+  };
+}
+
+export interface LocalModelRequest {
+  messages: Array<{ role: string; content: string }>;
+  model?: string;
+  temperature?: number;
+  max_tokens?: number;
+  stream?: boolean;
+}
+
+export interface LocalModelResponse {
+  content: string;
+  model: string;
+  tokensUsed?: {
+    input: number;
+    output: number;
+    total: number;
+  };
+  stopReason?: string;
+}
