@@ -418,6 +418,15 @@ export default class Chat extends Command {
     this.llm = new LLMServiceLiteLLM();
     if (flags.model) this.llm.setModel(flags.model);
 
+    // ── Auto-init: if no config, run quick inline setup ─────────────────────
+    if (!ConfigService.isInitialized()) {
+      const initOk = await this._autoInit();
+      if (!initOk) {
+        o(p(A.ye, '\n  Setup cancelled. Run again anytime.\n\n'));
+        process.exit(0);
+      }
+    }
+
     const cfg = ConfigService.loadConfig();
     this.sessName = `chat-${Date.now()}`;
     this.conv.createSession(this.sessName, cfg.apiProvider, this.llm.getModel());
@@ -442,6 +451,79 @@ export default class Chat extends Command {
         process.exit(0);
       },
     ).show();
+  }
+
+  // ─── Auto-init (first-run setup) ───────────────────────────────────────────
+
+  private async _autoInit(): Promise<boolean> {
+    o('\n');
+    o(p(A.cy + A.b, '  ╭────────────────────────────────────────────────╮\n'));
+    o(p(A.cy + A.b, '  │') + p(A.wh + A.b, '  ⚡ Welcome to Optimus — First-Time Setup') + p(A.cy + A.b, '      │\n'));
+    o(p(A.cy + A.b, '  ╰────────────────────────────────────────────────╯\n'));
+    o('\n');
+    o(p(A.gy, '  This takes about 10 seconds. You only need to do it once.\n\n'));
+
+    // ── Provider selection ──
+    const providers = [
+      { key: '1', name: 'Google Gemini', value: 'gemini'    as const },
+      { key: '2', name: 'OpenAI',        value: 'openai'    as const },
+      { key: '3', name: 'Anthropic',     value: 'anthropic' as const },
+    ];
+
+    o(p(A.wh + A.b, '  Select your AI provider:\n'));
+    for (const pr of providers) {
+      o(p(A.gy, `    ${pr.key}) `) + p(A.wh, pr.name) + '\n');
+    }
+    o('\n');
+
+    const providerKey = await this._readLineRaw(p(A.mg + A.b, '  ❯ ') + p(A.gy, 'Enter 1/2/3: '));
+    const provider = providers.find(p => p.key === providerKey.trim());
+    if (!provider) return false;
+
+    o(p(A.gr, `  ✔ ${provider.name}\n\n`));
+
+    // ── API key ──
+    const apiKey = await this._readLineRaw(p(A.mg + A.b, '  ❯ ') + p(A.gy, `Enter your ${provider.name} API key: `));
+    if (!apiKey.trim()) return false;
+    if (!ConfigService.validateApiKey(apiKey.trim(), provider.value)) {
+      o(p(A.re, `  ✗ Invalid API key format for ${provider.name}.\n`));
+      return false;
+    }
+
+    o(p(A.gr, `  ✔ API key saved (${apiKey.trim().slice(0, 6)}***)\n\n`));
+
+    // ── Workspace name ──
+    const workspaceName = 'optimus-workspace';
+
+    try {
+      ConfigService.initializeWorkspace(workspaceName, provider.value, apiKey.trim());
+      ConfigService.createWorkspaceStructure(workspaceName);
+      o(p(A.gr + A.b, '  ✅ Setup complete! Starting Optimus...\n\n'));
+      return true;
+    } catch (err: any) {
+      o(p(A.re, `  ✗ Setup failed: ${err.message}\n`));
+      return false;
+    }
+  }
+
+  /** Read a single line from stdin (raw mode, blocking). Used only for auto-init. */
+  private _readLineRaw(prompt: string): Promise<string> {
+    return new Promise((resolve) => {
+      o(prompt);
+      let buf = '';
+      process.stdin.setRawMode(false);
+      process.stdin.resume();
+      process.stdin.setEncoding('utf8');
+      const handler = (data: string) => {
+        buf += data;
+        if (buf.includes('\n') || buf.includes('\r')) {
+          process.stdin.removeListener('data', handler);
+          process.stdin.pause();
+          resolve(buf.replace(/[\r\n]+$/, ''));
+        }
+      };
+      process.stdin.on('data', handler);
+    });
   }
 
   // ─── Ask the LLM ────────────────────────────────────────────────────────────

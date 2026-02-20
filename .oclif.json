@@ -1,8 +1,9 @@
 {
-  "bin": "cli-project",
-  "dirname": "cli-project",
-  "description": "A Node.js CLI project with pnpm workspace and oclif",
+  "bin": "optimus",
+  "dirname": "optimus",
+  "description": "Optimus — AI Coding Agent",
   "commands": "dist/commands",
+  "default": "chat",
   "plugins": [
     "@oclif/plugin-help",
     "@oclif/plugin-version"

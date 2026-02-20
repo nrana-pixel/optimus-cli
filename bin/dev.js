@@ -9,6 +9,12 @@ const __dirname = dirname(__filename);
 
 const root = join(__dirname, '..');
 
-await run(process.argv.slice(2), {
+// Default to "chat" command if no subcommand is given
+const args = process.argv.slice(2);
+if (args.length === 0 || (args.length > 0 && args[0].startsWith('-'))) {
+  args.unshift('chat');
+}
+
+await run(args, {
   root,
 });

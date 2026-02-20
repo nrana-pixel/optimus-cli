@@ -5,13 +5,13 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "cli-project": "./bin/dev.js",
-    "ai": "./bin/dev.js"
+    "optimus": "./bin/dev.js"
   },
   "scripts": {
     "build": "tsc",
     "dev": "node --loader ts-node/esm src/index.ts",
     "start": "node bin/dev.js",
+    "optimus": "node bin/dev.js",
     "chat": "node bin/dev.js chat",
     "config-cli": "node bin/dev.js config",
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -42,8 +42,8 @@
     "node": ">=18.0.0"
   },
   "oclif": {
-    "bin": "cli-project",
-    "dirname": "cli-project",
+    "bin": "optimus",
+    "dirname": "optimus",
     "commands": "dist/commands",
     "plugins": [
       "@oclif/plugin-help",
