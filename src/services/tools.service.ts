@@ -37,6 +37,7 @@ export type ToolName =
   | 'search_files'
   | 'find_symbol'
   | 'run_command'
+  | 'run_tests'
   | 'git_status'
   | 'git_diff'
   | 'git_log';
@@ -110,7 +111,7 @@ export class ToolsService {
       let output = '';
 
       // In plan mode, block destructive tools
-      if (this.planMode && ['write_file', 'edit_file', 'run_command'].includes(call.name)) {
+      if (this.planMode && ['write_file', 'edit_file', 'run_command', 'run_tests'].includes(call.name)) {
         return {
           name: call.name, args: call.args,
           output: '', error: `🔒 Plan mode active — ${call.name} is blocked. Use /plan to toggle off.`,
@@ -138,6 +139,7 @@ export class ToolsService {
           output = this.findSymbol(call.args.symbol ?? '');
           break;
         case 'run_command':
+        case 'run_tests':
           output = this.runCommand(call.args.command ?? '');
           break;
         case 'git_status':
@@ -525,7 +527,8 @@ Do NOT ask for permission to write files — just do it.
 | edit_file | path: string, old_content: string, new_content: string | Replace specific content in a file (preferred for edits) |
 | search_files | pattern: string, glob?: string | Grep across project |
 | find_symbol | symbol: string | Locate a class/function definition |
-| run_command | command: string | Run a safe read-only terminal command |
+| run_command | command: string | Run a safe terminal command |
+| run_tests | command: string | Run tests/typecheck (e.g. npm test, tsc). Use this after editing code to catch and auto-fix errors quickly within this loop. |
 | git_status | (none) | Show git working tree status |
 | git_diff | ref?: string | Show git diff (optionally from a ref) |
 | git_log | count?: string | Show recent git commits |

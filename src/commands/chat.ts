@@ -402,7 +402,7 @@ export default class Chat extends Command {
 
   private llm!:  LLMServiceLiteLLM;
   private conv   = new ConversationService();
-  private msgs:  { role: string; content: string }[] = [];
+  private msgs:  { role: string; content: string | any[] }[] = [];
   private toolsEnabled = true;
   private planMode     = false;
   private tokens = 0;
@@ -549,8 +549,42 @@ export default class Chat extends Command {
   // ─── Ask the LLM ────────────────────────────────────────────────────────────
 
   private async _ask(line: string) {
-    this.msgs.push({ role: 'user', content: line });
-    this.conv.addMessage('user', line);
+    // ── Check for Vision (images) ──
+    const imagePaths: string[] = [];
+    let cleanLine = line;
+
+    // Detect paths like C:\\path\img.png or /path/img.png, and remove quotes if any
+    const IMG_RE = /(["']?)((?:[a-zA-Z]:\\|\/)[^\s"']+\.(?:png|jpg|jpeg|webp|gif|bmp))\1/gi;
+    let m;
+    while ((m = IMG_RE.exec(line)) !== null) {
+      const p = m[2];
+      if (!imagePaths.includes(p)) imagePaths.push(p);
+      cleanLine = cleanLine.replace(m[0], '').trim();
+    }
+
+    let payloadContent: string | any[] = cleanLine;
+    const validImages = [];
+
+    // Verify files exist
+    const fs = require('fs');
+    for (const p of imagePaths) {
+      if (fs.existsSync(p)) validImages.push(p);
+    }
+
+    if (validImages.length > 0) {
+      const parts: any[] = [{ type: 'text', text: cleanLine || 'What is in this image?' }];
+      for (const imgPath of validImages) {
+        const ext = require('path').extname(imgPath).toLowerCase().slice(1);
+        const mime = ext === 'jpg' ? 'jpeg' : ext;
+        const b64 = fs.readFileSync(imgPath).toString('base64');
+        parts.push({ type: 'image_url', image_url: { url: `data:image/${mime};base64,${b64}` } });
+      }
+      payloadContent = parts;
+      o(p(A.cy, `  📷 Detected ${validImages.length} image(s)\n`));
+    }
+
+    this.msgs.push({ role: 'user', content: payloadContent });
+    this.conv.addMessage('user', payloadContent);
 
     const spinner = new Spinner();
     o('\n');
@@ -690,7 +724,17 @@ export default class Chat extends Command {
           }
 
           // ── Built-in tool ──
-          if (call.name === 'write_file') {
+          if (call.name === 'run_command') {
+            Spinner.notify(`  🔧 ${call.name}(${argHint})`);
+            
+            // Interactive Terminal Confirmation
+            const ans = await this._readLineRaw(`\n  Optimus wants to run: ${p(A.wh + A.b, call.args.command)}\n  Allow? [Y/n]: `);
+            if (ans.trim().toLowerCase() === 'n') {
+              resultParts.push(ToolsService.formatToolResult({name: 'run_command', args: call.args, output: '', error: 'User denied permission to run this command.', durationMs: 0}));
+              o(p(A.re, `  ⚠  Command denied by user.\n`));
+              continue;
+            }
+          } else if (call.name === 'write_file') {
             Spinner.notify(`  ✏  write_file → ${call.args.path ?? '?'}`);
           } else if (call.name === 'edit_file') {
             Spinner.notify(`  ✂  edit_file → ${call.args.path ?? '?'}`);
@@ -795,7 +839,10 @@ export default class Chat extends Command {
           const who = m.role === 'user'
             ? p(A.cy + A.b, '[You]    ')
             : p(A.ye + A.b, '[Optimus]');
-          const txt = m.content.length > 200 ? m.content.slice(0, 200) + '…' : m.content;
+          const textOnly = Array.isArray(m.content) 
+            ? m.content.filter(c => c.type === 'text').map(c => c.text).join('\n') 
+            : m.content;
+          const txt = textOnly.length > 200 ? textOnly.slice(0, 200) + '…' : textOnly;
           const indented = txt.replace(/\n/g, '\n           ');
           o(`  ${p(A.gy, String(i + 1).padStart(2) + '.')} ${who}  ${indented}\n`);
         });

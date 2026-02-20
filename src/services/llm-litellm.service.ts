@@ -131,7 +131,7 @@ export class LLMServiceLiteLLM {
    * Send a full message history and get a response (multi-turn chat)
    */
   async completeWithHistory(
-    messages: Array<{ role: string; content: string }>,
+    messages: Array<{ role: string; content: string | any[] }>,
     callbacks?: LLMStreamCallback
   ): Promise<LLMResponse> {
     // The JS litellm package does not support Gemini — use native REST for it
@@ -183,7 +183,7 @@ export class LLMServiceLiteLLM {
    * Converts the OpenAI-style messages array into Gemini's `contents` format.
    */
   private async completeGeminiNative(
-    messages: Array<{ role: string; content: string }>,
+    messages: Array<{ role: string; content: string | any[] }>,
     callbacks?: LLMStreamCallback
   ): Promise<LLMResponse> {
     try {
@@ -192,15 +192,35 @@ export class LLMServiceLiteLLM {
       let chatMessages = messages;
 
       if (messages.length > 0 && messages[0].role === 'system') {
-        systemInstruction = messages[0].content;
+        const sysMsg = messages[0].content;
+        systemInstruction = Array.isArray(sysMsg) 
+          ? sysMsg.filter(c => c.type === 'text').map(c => c.text).join('\n') 
+          : sysMsg;
         chatMessages = messages.slice(1);
       }
 
-      // Convert to Gemini contents format  (user → model alternation)
-      const contents = chatMessages.map((m) => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      }));
+      // Convert to Gemini contents format (user → model alternation)
+      const contents = chatMessages.map((m) => {
+        let parts: any[] = [];
+        if (typeof m.content === 'string') {
+          parts = [{ text: m.content }];
+        } else if (Array.isArray(m.content)) {
+          parts = m.content.map(c => {
+            if (c.type === 'text') return { text: c.text };
+            if (c.type === 'image_url') {
+              const match = c.image_url?.url?.match(/^data:(image\/[a-z]+);base64,(.*)$/);
+              if (match) {
+                return { inlineData: { mimeType: match[1], data: match[2] } };
+              }
+            }
+            return { text: JSON.stringify(c) };
+          });
+        }
+        return {
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts,
+        };
+      });
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
 

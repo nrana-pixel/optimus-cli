@@ -86,7 +86,7 @@ export class LocalModelService {
   }
 
   async completeWithHistory(
-    messages: Array<{ role: string; content: string }>,
+    messages: Array<{ role: string; content: string | any[] }>,
     callbacks?: LLMStreamCallback,
   ): Promise<LocalModelResponse> {
     try {
@@ -101,7 +101,7 @@ export class LocalModelService {
   // ─── Ollama streaming ───────────────────────────────────────────────────
 
   private async streamOllama(
-    messages: Array<{ role: string; content: string }>,
+    messages: Array<{ role: string; content: string | any[] }>,
     callbacks?: LLMStreamCallback,
   ): Promise<LocalModelResponse> {
     const modelName = this.model.model || 'llama2';
@@ -172,7 +172,7 @@ export class LocalModelService {
   // ─── OpenAI-compatible streaming ──────────────────────────────────────────
 
   private async streamOpenAI(
-    messages: Array<{ role: string; content: string }>,
+    messages: Array<{ role: string; content: string | any[] }>,
     callbacks?: LLMStreamCallback,
   ): Promise<LocalModelResponse> {
     const modelName = this.model.model || 'default';

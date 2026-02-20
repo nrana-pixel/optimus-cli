@@ -8,8 +8,8 @@ import { join } from 'path';
 import { homedir } from 'os';
 
 export interface Message {
-  role: 'user' | 'assistant';
-  content: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string | any[];
   timestamp: string;
 }
 
@@ -119,7 +119,7 @@ export class ConversationService {
   /**
    * Add a message to the current session
    */
-  addMessage(role: 'user' | 'assistant', content: string): Message {
+  addMessage(role: 'user' | 'assistant' | 'system', content: string | any[]): Message {
     if (!this.currentSession) {
       throw new Error('No active session');
     }
@@ -158,14 +158,19 @@ export class ConversationService {
     }
 
     return this.currentSession.messages
-      .map((msg) => `${msg.role.toUpperCase()}: ${msg.content}`)
+      .map((msg) => {
+        const text = Array.isArray(msg.content) 
+          ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n') 
+          : msg.content;
+        return `${msg.role.toUpperCase()}: ${text}`;
+      })
       .join('\n\n');
   }
 
   /**
    * Get messages for LLM context (last N messages)
    */
-  getContextMessages(limit: number = 10): Array<{ role: string; content: string }> {
+  getContextMessages(limit: number = 10): Array<{ role: string; content: string | any[] }> {
     if (!this.currentSession) {
       return [];
     }
