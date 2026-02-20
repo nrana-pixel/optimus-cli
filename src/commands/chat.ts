@@ -5,6 +5,7 @@ import { ConfigService } from '../services/config.service.js';
 import { ConversationService } from '../services/conversation.service.js';
 import { ToolsService } from '../services/tools.service.js';
 import { LocalModelService } from '../services/local-model.service.js';
+import { MCPService } from '../services/mcp.service.js';
 import type { LocalModel } from '../types/local-model.js';
 import { resolve } from 'path';
 
@@ -49,6 +50,9 @@ const CMDS = [
   { cmd: '/plan',       args: '',           desc: 'Toggle plan mode (read-only, no writes)'        },
   { cmd: '/undo',       args: '',           desc: 'Undo all file changes from last response'       },
   { cmd: '/changes',    args: '',           desc: 'Show files changed this session'                },
+  { cmd: '/mcp',        args: '',           desc: 'Show connected MCP servers & tools'             },
+  { cmd: '/mcp-add',    args: '<name>',     desc: 'Add an MCP server (e.g. brave-search)'          },
+  { cmd: '/mcp-remove', args: '<name>',     desc: 'Remove an MCP server'                           },
   { cmd: '/cost',       args: '',           desc: 'Show tokens + estimated cost'                   },
   { cmd: '/save',       args: '',           desc: 'Force-save session to disk'                     },
   { cmd: '/sessions',   args: '',           desc: 'List saved sessions'                            },
@@ -413,6 +417,9 @@ export default class Chat extends Command {
   private lastTools: ToolsService | null = null;
   private projectContext: string | null = null;
 
+  // ── MCP ──────────────────────────────────────────────────────────────────────
+  private mcpService = new MCPService();
+
   async run() {
     const { flags } = await this.parse(Chat);
     this.llm = new LLMServiceLiteLLM();
@@ -437,8 +444,21 @@ export default class Chat extends Command {
     this._banner();
 
     if (this.projectContext) {
-      o(p(A.gr, '  📋 Loaded project context from OPTIMUS.md\n\n'));
+      o(p(A.gr, '  📋 Loaded project context from OPTIMUS.md\n'));
     }
+
+    // ── Auto-connect to MCP servers ──
+    const mcpConfigs = MCPService.loadConfig();
+    if (mcpConfigs.length > 0) {
+      const { connected, failed } = await this.mcpService.connectAll();
+      if (connected.length) {
+        o(p(A.cy, `  🔌 MCP: ${connected.length} server(s) connected`) + p(A.gy, ` — ${this.mcpService.getTools().length} tool(s) available\n`));
+      }
+      for (const f of failed) {
+        o(p(A.re, `  ⚠  MCP "${f.name}" failed: ${f.error.slice(0, 60)}\n`));
+      }
+    }
+    o('\n');
 
     new Prompt(
       async (line) => {
@@ -580,8 +600,9 @@ export default class Chat extends Command {
 
     // ── Cloud LLM path ──────────────────────────────────────────────────────
     try {
+      const mcpSection = this.mcpService.getTools().length > 0 ? this.mcpService.mcpToolsSection() : '';
       const systemMsg = this.toolsEnabled
-        ? [{ role: 'system', content: ToolsService.toolsSystemSection(this.projectContext, this.planMode) }]
+        ? [{ role: 'system', content: ToolsService.toolsSystemSection(this.projectContext, this.planMode) + mcpSection }]
         : (this.projectContext ? [{ role: 'system', content: `You are Optimus — an expert AI coding agent.\n\n## Project Context (from OPTIMUS.md)\n${this.projectContext}` }] : []);
       let msgs = [...systemMsg, ...this.msgs];
 
@@ -654,6 +675,21 @@ export default class Chat extends Command {
         for (const call of toolCalls) {
           o('\n');
           const argHint = call.args.path ?? call.args.pattern ?? call.args.symbol ?? call.args.command ?? call.args.ref ?? '';
+
+          // ── Check if this is an MCP tool ──
+          if (this.mcpService.isMCPTool(call.name)) {
+            Spinner.notify(`  🔌 MCP: ${call.name}`);
+            const ts = new Spinner('Running');
+            ts.start(); started = false;
+            const mcpResult = await this.mcpService.callTool(call.name, call.args as Record<string, unknown>);
+            ts.stop('Optimus');
+            const body = mcpResult.isError ? `ERROR: ${mcpResult.content}` : mcpResult.content;
+            resultParts.push(`<tool_result>\n<name>${call.name}</name>\n<output>\n${body}\n</output>\n</tool_result>`);
+            o(p(A.gy, `  ❖ [${mcpResult.serverName}] ${mcpResult.content.slice(0, 120)}\n`));
+            continue;
+          }
+
+          // ── Built-in tool ──
           if (call.name === 'write_file') {
             Spinner.notify(`  ✏  write_file → ${call.args.path ?? '?'}`);
           } else if (call.name === 'edit_file') {
@@ -1052,6 +1088,127 @@ export default class Chat extends Command {
         o(p(A.gr + A.b, `  ├${HR}┤\n`));
         o(p(A.gr + A.b, '  │') + p(A.gy, `  ${this.lastTools.written.length} file(s) written • /undo to revert`) + '\n');
         o(p(A.gr + A.b, `  └${HR}┘\n`));
+        break;
+      }
+
+      // /mcp ────────────────────────────────────────────────────
+      case '/mcp': {
+        const configs = MCPService.loadConfig();
+        if (configs.length === 0) {
+          o(p(A.ye + A.b, '  No MCP servers configured.\n'));
+          o(p(A.gy, '  Try adding one with /mcp-add.\n'));
+          break;
+        }
+
+        const W = 64;
+        const HR = '─'.repeat(W);
+        o(p(A.cy + A.b, `  ┌${HR}┐\n`));
+        o(p(A.cy + A.b,  '  │') + p(A.b + A.wh, '  🔌 Connected MCP Servers') + p(A.gy, ' '.repeat(W - 27)) + p(A.cy + A.b, '│\n'));
+        o(p(A.cy + A.b, `  ├${HR}┤\n`));
+
+        let totalTools = 0;
+        for (const cfg of configs) {
+          const isConnected = this.mcpService.getConnectedCount() > 0 && this.mcpService.getTools().some(t => t.serverName === cfg.name);
+          const badge = isConnected ? p(A.gr + A.b, '● online ') : (cfg.enabled ? p(A.re + A.b, '○ offline') : p(A.gy + A.b, '○ off    '));
+          const toolsForServer = this.mcpService.getTools().filter(t => t.serverName === cfg.name);
+          totalTools += toolsForServer.length;
+          
+          o(p(A.cy + A.b, '  │') + `  ${badge}  ${p(A.wh + A.b, cfg.name.padEnd(20))} ${p(A.gy, String(toolsForServer.length).padStart(3) + ' tools')}\n`);
+        }
+        o(p(A.cy + A.b, `  ├${HR}┤\n`));
+        o(p(A.cy + A.b, '  │') + p(A.gy, `  ${this.mcpService.getConnectedCount()} server(s) running • ${totalTools} tool(s) available`) + '\n');
+        o(p(A.cy + A.b, `  └${HR}┘\n`));
+        break;
+      }
+
+      // /mcp-add ────────────────────────────────────────────────
+      case '/mcp-add': {
+        const serverName = rest[0];
+        if (!serverName) {
+          o(p(A.re, '  ⚠  Usage: /mcp-add <name> [command] [args...]\n'));
+          o(p(A.gy, '  Examples:\n'));
+          o(p(A.gy, '    /mcp-add brave-search npx -y @modelcontextprotocol/server-brave-search\n'));
+          o(p(A.gy, '    /mcp-add filesystem   npx -y @modelcontextprotocol/server-filesystem /path/to/dir\n'));
+          
+          const popular = MCPService.getPopularServers();
+          o(p(A.wh + A.b, '\n  Popular defaults (you can just type /mcp-add <name>):\n'));
+          for (const s of popular) {
+            o(p(A.cy, `    ${s.name.padEnd(15)}`) + p(A.gy, ` — ${s.description}\n`));
+          }
+          break;
+        }
+
+        // Check if it's a popular pre-configured server
+        const popular = MCPService.getPopularServers().find(s => s.name === serverName);
+        let command = rest[1];
+        let args = rest.slice(2);
+        let env: Record<string, string> | undefined = undefined;
+
+        if (!command) {
+          if (popular) {
+            command = popular.command;
+            args = popular.args;
+            if (popular.env) {
+              env = popular.env;
+              // We'll prompt for env vars after adding if they are empty
+            }
+          } else {
+            o(p(A.re, `  ⚠  No command provided and "${serverName}" is not a known popular server.\n`));
+            break;
+          }
+        }
+
+        // Prompt for environment variables if needed
+        if (env && Object.keys(env).length > 0) {
+          o(p(A.ye + A.b, `\n  This MCP server requires environment variables (e.g. API keys).\n`));
+          o(p(A.gy, `  Please enter them below (or press Enter to skip and edit manually later).\n\n`));
+          
+          for (const key of Object.keys(env)) {
+            const val = await this._readLineRaw(p(A.mg + A.b, '  ❯ ') + p(A.wh, `${key}: `));
+            if (val.trim()) env[key] = val.trim();
+          }
+          o('\n');
+        }
+
+        const newCfg = {
+          name: serverName,
+          command,
+          args,
+          env,
+          enabled: true,
+        };
+
+        MCPService.addServer(newCfg);
+        o(p(A.gr + A.b, `  ✔ MCP server "${serverName}" configured.\n`));
+
+        const ts = new Spinner('Connecting');
+        ts.start();
+        try {
+          const discovered = await this.mcpService.connectToServer(newCfg);
+          ts.stop('Optimus');
+          o(p(A.gr + A.b, `  🔌 Connected! Discovered ${discovered.length} tool(s).\n`));
+        } catch (e: any) {
+          ts.stop('Optimus');
+          o(p(A.re, `  ⚠  Saved configuration, but failed to connect:\n  ${e.message}\n`));
+        }
+        break;
+      }
+
+      // /mcp-remove ─────────────────────────────────────────────
+      case '/mcp-remove': {
+        const serverName = rest[0];
+        if (!serverName) {
+          o(p(A.re, '  ⚠  Usage: /mcp-remove <name>\n'));
+          break;
+        }
+
+        const removed = MCPService.removeServer(serverName);
+        if (removed) {
+          await this.mcpService.disconnectServer(serverName);
+          o(p(A.gr + A.b, `  ✔ Removed MCP server "${serverName}".\n`));
+        } else {
+          o(p(A.ye, `  ⚠  MCP server "${serverName}" not found in configuration.\n`));
+        }
         break;
       }
 
