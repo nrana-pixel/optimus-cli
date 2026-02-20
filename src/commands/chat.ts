@@ -6,6 +6,7 @@ import { ConversationService } from '../services/conversation.service.js';
 import { ToolsService } from '../services/tools.service.js';
 import { LocalModelService } from '../services/local-model.service.js';
 import { MCPService } from '../services/mcp.service.js';
+import { IndexService, geminiEmbed, openaiEmbed } from '../services/index.service.js';
 import type { LocalModel } from '../types/local-model.js';
 import { resolve } from 'path';
 
@@ -53,6 +54,9 @@ const CMDS = [
   { cmd: '/mcp',        args: '',           desc: 'Show connected MCP servers & tools'             },
   { cmd: '/mcp-add',    args: '<name>',     desc: 'Add an MCP server (e.g. brave-search)'          },
   { cmd: '/mcp-remove', args: '<name>',     desc: 'Remove an MCP server'                           },
+  { cmd: '/index',      args: '',           desc: 'Build/refresh codebase symbol index'            },
+  { cmd: '/repomap',    args: '',           desc: 'Show the repo map (symbol tree of codebase)'    },
+  { cmd: '/semantic',   args: '<query>',    desc: 'Semantic search across codebase by meaning'     },
   { cmd: '/cost',       args: '',           desc: 'Show tokens + estimated cost'                   },
   { cmd: '/save',       args: '',           desc: 'Force-save session to disk'                     },
   { cmd: '/sessions',   args: '',           desc: 'List saved sessions'                            },
@@ -420,6 +424,10 @@ export default class Chat extends Command {
   // ── MCP ──────────────────────────────────────────────────────────────────────
   private mcpService = new MCPService();
 
+  // ── Index (Phase 3) ────────────────────────────────────────────────────────
+  private indexService: IndexService | null = null;
+  private repoMap: string = '';
+
   async run() {
     const { flags } = await this.parse(Chat);
     this.llm = new LLMServiceLiteLLM();
@@ -458,6 +466,9 @@ export default class Chat extends Command {
         o(p(A.re, `  ⚠  MCP "${f.name}" failed: ${f.error.slice(0, 60)}\n`));
       }
     }
+
+    // ── Build symbol index in background (non-blocking) ──
+    this._buildIndexBackground();
     o('\n');
 
     new Prompt(
@@ -546,6 +557,93 @@ export default class Chat extends Command {
     });
   }
 
+  // ─── Index helpers (Phase 3) ─────────────────────────────────────────────────
+
+  /** Build the symbol index in the background — doesn't block startup */
+  private _buildIndexBackground() {
+    setImmediate(async () => {
+      try {
+        this.indexService = new IndexService(resolve('.'));
+        const stats = await this.indexService.buildIndex();
+        if (stats.files > 0 || this.repoMap === '') {
+          this.repoMap = this.indexService.generateRepoMap();
+          // Quiet confirm printed on next line after prompt is ready
+          Spinner.notify(`  🗂  Index ready — ${stats.files + stats.skipped} files, ${stats.symbols} new symbols`);
+        }
+      } catch (err: any) {
+        // Non-fatal — just skip indexing silently
+      }
+    });
+  }
+
+  /** Get an embed function based on the current provider config */
+  private _getEmbedFn(): ((text: string) => Promise<number[]>) | null {
+    try {
+      const cfg = ConfigService.loadConfig();
+      const key = ConfigService.getApiKey();
+      if (cfg.apiProvider === 'gemini') {
+        return (t) => geminiEmbed(t, key);
+      }
+      if (cfg.apiProvider === 'openai') {
+        return (t) => openaiEmbed(t, key);
+      }
+    } catch { /* no config */ }
+    return null;
+  }
+
+  // ─── Planner Agent (Phase 3) ─────────────────────────────────────────────────
+
+  /**
+   * Planner Agent — fired for short or vague user queries (< 60 chars, no code).
+   *
+   * Makes a fast, cheap micro-call to the LLM asking:
+   *   "Given this codebase map, what files/symbols should I look at to answer: <query>?"
+   *
+   * The planner's answer is injected as a hidden system note into the conversation
+   * so the main ReAct LLM starts with a focused plan rather than exploring blindly.
+   *
+   * This is the same technique Claude Code uses internally before routing requests.
+   * It is fully non-blocking and skipped if the repo map hasn't been built yet.
+   */
+  private async _plannerExpand(userQuery: string): Promise<string | null> {
+    // Only run for short/vague queries without code snippets
+    const isVague = userQuery.length < 80 && !userQuery.includes('```') && !userQuery.includes('\n');
+    if (!isVague || !this.repoMap || !this.toolsEnabled) return null;
+
+    try {
+      const plannerSystem = `You are a senior software engineer acting as a PLANNING AGENT.
+Given a vague user request and a repo map of the codebase, output a SHORT (max 5 lines) structured plan:
+- Which 1-3 files are most likely relevant
+- Which symbol or function to look at first
+- What the key concern is
+
+Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point plan.`;
+
+      const plannerPrompt = `## Repo Map\n${this.repoMap.slice(0, 2000)}\n\n## User Request\n"${userQuery}"\n\nBriefly: which files/symbols should I look at first, and what's the plan?`;
+
+      const result = await this.llm.completeWithHistory(
+        [
+          { role: 'system', content: plannerSystem },
+          { role: 'user',   content: plannerPrompt },
+        ],
+        // No callbacks — silent micro-call
+      );
+
+      const plan = result.content.trim();
+      if (plan.length > 20) {
+        // Track token cost
+        this.tokens += result.tokensUsed?.total ?? 0;
+        this.cost   += result.cost?.total ?? 0;
+        return plan;
+      }
+    } catch {
+      // Planner failure is always non-fatal — fall through to normal path
+    }
+    return null;
+  }
+
+
+
   // ─── Ask the LLM ────────────────────────────────────────────────────────────
 
   private async _ask(line: string) {
@@ -585,6 +683,20 @@ export default class Chat extends Command {
 
     this.msgs.push({ role: 'user', content: payloadContent });
     this.conv.addMessage('user', payloadContent);
+
+    // ── Planner Agent: silently expand vague queries before main LLM call ──
+    // Run BEFORE the spinner so it's transparent to the user.
+    // Only fires for short/vague text queries when repo map is ready.
+    if (typeof payloadContent === 'string') {
+      const plan = await this._plannerExpand(payloadContent);
+      if (plan) {
+        // Inject plan as a hidden system note — not shown to user, only to LLM
+        this.msgs.push({
+          role: 'assistant',
+          content: `[PLANNER NOTE — internal, not shown to user]\n${plan}`,
+        });
+      }
+    }
 
     const spinner = new Spinner();
     o('\n');
@@ -634,16 +746,22 @@ export default class Chat extends Command {
 
     // ── Cloud LLM path ──────────────────────────────────────────────────────
     try {
-      const mcpSection = this.mcpService.getTools().length > 0 ? this.mcpService.mcpToolsSection() : '';
+      const mcpSection   = this.mcpService.getTools().length > 0 ? this.mcpService.mcpToolsSection() : '';
+      const repoMapSection = this.repoMap ? `\n\n${this.repoMap}` : '';
       const systemMsg = this.toolsEnabled
-        ? [{ role: 'system', content: ToolsService.toolsSystemSection(this.projectContext, this.planMode) + mcpSection }]
-        : (this.projectContext ? [{ role: 'system', content: `You are Optimus — an expert AI coding agent.\n\n## Project Context (from OPTIMUS.md)\n${this.projectContext}` }] : []);
+        ? [{ role: 'system', content: ToolsService.toolsSystemSection(this.projectContext, this.planMode) + mcpSection + repoMapSection }]
+        : (this.projectContext ? [{ role: 'system', content: `You are Optimus — an expert AI coding agent.\n\n## Project Context (from OPTIMUS.md)\n${this.projectContext}${repoMapSection}` }] : []);
       let msgs = [...systemMsg, ...this.msgs];
 
       const MAX_LOOPS = 8;
       let loops = 0;
       const tools = new ToolsService(resolve('.'));
-      tools.planMode = this.planMode;
+      tools.planMode    = this.planMode;
+      // ── Inject Phase 3 index into tool executor ──
+      if (this.indexService) {
+        tools.indexService = this.indexService;
+        tools.embedFn      = this._getEmbedFn();
+      }
       this.lastTools = tools;
 
       while (loops < MAX_LOOPS) {
@@ -1259,6 +1377,93 @@ export default class Chat extends Command {
         break;
       }
 
+      // /index ───────────────────────────────────────────────────
+      case '/index': {
+        if (!this.indexService) {
+          this.indexService = new IndexService(resolve('.'));
+        }
+        const ts = new Spinner('Indexing');
+        ts.start();
+        try {
+          const stats = await this.indexService.buildIndex();
+          this.repoMap = this.indexService.generateRepoMap();
+          ts.stop('Optimus');
+          const dbStats = this.indexService.getStats();
+          o('\n');
+          const W = 54, HR = '─'.repeat(W);
+          o(p(A.mg + A.b, `  ┌${HR}┐\n`));
+          o(p(A.mg + A.b,  '  │') + p(A.b + A.wh, '  🗂  Symbol Index') + p(A.gy, ' '.repeat(W - 17)) + p(A.mg + A.b, '│\n'));
+          o(p(A.mg + A.b, `  ├${HR}┤\n`));
+          o(p(A.mg + A.b, '  │') + p(A.gy, `  ✔ ${stats.files} files newly indexed`) + '\n');
+          o(p(A.mg + A.b, '  │') + p(A.gy, `  ✔ ${stats.skipped} files unchanged (cached)`) + '\n');
+          o(p(A.mg + A.b, '  │') + p(A.gy, `  ✔ ${dbStats.symbols} total symbols indexed`) + '\n');
+          o(p(A.mg + A.b, `  └${HR}┘\n`));
+        } catch (e: any) {
+          ts.stop('Optimus');
+          o(p(A.re, `  ⚠  Indexing failed: ${e.message}\n`));
+        }
+        break;
+      }
+
+      // /repomap ───────────────────────────────────────────────
+      case '/repomap': {
+        if (!this.repoMap) {
+          o(p(A.ye, '  ⚠  No repo map yet. Run /index first.\n'));
+          break;
+        }
+        o('\n');
+        o(p(A.mg + A.b, '  🗂  Repo Map\n'));
+        o(p(A.gy, '─'.repeat(56) + '\n'));
+        // Print first 80 lines max so it doesn't flood the terminal
+        const mapLines = this.repoMap.split('\n').slice(0, 80);
+        o(mapLines.map(l => '  ' + p(A.wh, l)).join('\n') + '\n');
+        if (this.repoMap.split('\n').length > 80) {
+          o(p(A.gy, '  ... (truncated, full map is in system prompt)\n'));
+        }
+        break;
+      }
+
+      // /semantic ─────────────────────────────────────────────
+      case '/semantic': {
+        const query = rest.join(' ');
+        if (!query) {
+          o(p(A.re, '  ⚠  Usage: /semantic <query>\n'));
+          o(p(A.gy, '  Example: /semantic authentication logic\n'));
+          break;
+        }
+        if (!this.indexService) {
+          o(p(A.ye, '  ⚠  Run /index first to build the codebase index.\n'));
+          break;
+        }
+        const embedFn = this._getEmbedFn();
+        if (!embedFn) {
+          o(p(A.ye, '  ⚠  Semantic search requires an OpenAI or Gemini API key.\n'));
+          break;
+        }
+
+        const ts2 = new Spinner('Searching');
+        ts2.start();
+        try {
+          const results = await this.indexService.semanticSearch(query, embedFn, 5);
+          ts2.stop('Optimus');
+          o('\n');
+          if (results.length === 0) {
+            o(p(A.ye, '  ⚠  No results. Run /index --embed first to build embeddings.\n'));
+            break;
+          }
+          o(p(A.mg + A.b, `  🔍  Semantic results for: "${query}"\n\n`));
+          for (const r of results) {
+            o(p(A.wh + A.b, `  ${r.file}`) + p(A.gy, ` lines ${r.lines}  score: ${r.score.toFixed(3)}\n`));
+            const preview = r.chunk.split('\n').slice(0, 4).join('\n');
+            o(p(A.gy, '  ' + preview.replace(/\n/g, '\n  ') + '\n\n'));
+          }
+        } catch (e: any) {
+          ts2.stop('Optimus');
+          o(p(A.re, `  ⚠  Semantic search failed: ${e.message}\n`));
+        }
+        break;
+      }
+
       default:
         o(p(A.re, `  Unknown command: ${p(A.b, cmd)}\n`));
         o(p(A.gy, '  Type /help or press / to see all commands.\n'));
@@ -1293,8 +1498,6 @@ export default class Chat extends Command {
     const BW = LW + 1 + RW;  // = 59 inner chars
 
     const bdr = (s: string) => p(A.mg, s);
-
-    // ── Cell builders — padding computed on RAW lengths, ANSI added after ───
 
     // Left cell: "  label     value   " padded to exactly LW visible chars
     const mkL = (rawLabel: string, rawValue: string): string => {

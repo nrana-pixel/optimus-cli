@@ -26,6 +26,7 @@ import {
 } from 'fs';
 import { join, resolve, relative, extname, dirname } from 'path';
 import { execSync } from 'child_process';
+import type { IndexService } from './index.service.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,8 @@ export type ToolName =
   | 'list_dir'
   | 'search_files'
   | 'find_symbol'
+  | 'lookup_symbol'
+  | 'semantic_search'
   | 'run_command'
   | 'run_tests'
   | 'git_status'
@@ -105,6 +108,15 @@ export class ToolsService {
   /** Whether this is plan-only mode (no writes) */
   public planMode: boolean = false;
 
+  /**
+   * Optional IndexService injection — when provided, find_symbol, lookup_symbol,
+   * and semantic_search use the SQLite index for faster, smarter results.
+   */
+  public indexService: IndexService | null = null;
+
+  /** Embed function for semantic_search tool — injected by Chat */
+  public embedFn: ((text: string) => Promise<number[]>) | null = null;
+
   async execute(call: ToolCall): Promise<ToolResult> {
     const start = Date.now();
     try {
@@ -136,7 +148,46 @@ export class ToolsService {
           output = this.searchFiles(call.args.pattern ?? '', call.args.glob ?? '');
           break;
         case 'find_symbol':
+          // Use fast SQLite index if available, otherwise fall back to grep
+          if (this.indexService) {
+            const syms = this.indexService.searchSymbols(call.args.symbol ?? '');
+            if (syms.length > 0) {
+              output = syms.map(s => `${s.file}:${s.line}:  ${s.kind}  ${s.name}  ${s.signature}`).join('\n');
+              break;
+            }
+          }
           output = this.findSymbol(call.args.symbol ?? '');
+          break;
+        case 'lookup_symbol':
+          if (this.indexService) {
+            const syms = this.indexService.lookupSymbol(call.args.name ?? '');
+            output = syms.length > 0
+              ? syms.map(s => `${s.file}:${s.line}: [${s.kind}] ${s.name} — ${s.signature}`).join('\n')
+              : `Symbol "${call.args.name}" not found in index. Try /index to rebuild.`;
+          } else {
+            output = this.findSymbol(call.args.name ?? '');
+          }
+          break;
+        case 'semantic_search':
+          if (this.indexService && this.embedFn) {
+            try {
+              const results = await this.indexService.semanticSearch(
+                call.args.query ?? '', this.embedFn,
+                parseInt(call.args.top_k ?? '5')
+              );
+              if (results.length === 0) {
+                output = 'No semantic matches found. The index may not have embeddings yet.';
+              } else {
+                output = results.map(r =>
+                  `## ${r.file} (lines ${r.lines}, score: ${r.score.toFixed(3)})\n${r.chunk}`
+                ).join('\n\n---\n\n');
+              }
+            } catch (err: any) {
+              output = `Semantic search failed: ${err.message}`;
+            }
+          } else {
+            output = 'Semantic search not available. Use search_files for keyword-based search instead.';
+          }
           break;
         case 'run_command':
         case 'run_tests':
@@ -526,7 +577,9 @@ Do NOT ask for permission to write files — just do it.
 | write_file | path: string, content: string | Create or overwrite a file (use for NEW files) |
 | edit_file | path: string, old_content: string, new_content: string | Replace specific content in a file (preferred for edits) |
 | search_files | pattern: string, glob?: string | Grep across project |
-| find_symbol | symbol: string | Locate a class/function definition |
+| find_symbol | symbol: string | Locate a class/function definition (regex-based) |
+| lookup_symbol | name: string | Fast exact symbol lookup using the SQLite index (preferred when available) |
+| semantic_search | query: string, top_k?: string | Find conceptually related code by meaning — e.g. 'authentication logic' finds auth code even if the word 'auth' isn't in the file |
 | run_command | command: string | Run a safe terminal command |
 | run_tests | command: string | Run tests/typecheck (e.g. npm test, tsc). Use this after editing code to catch and auto-fix errors quickly within this loop. |
 | git_status | (none) | Show git working tree status |
