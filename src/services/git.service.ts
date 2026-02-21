@@ -263,7 +263,7 @@ export class GitService {
         shortHash: e.hash.slice(0, 8),
         date:      e.date,
         message:   e.message,
-        author:    (e as any).author_name ?? '',
+        author:    (e as any).author ?? '',
         refs:      (e as any).refs ?? '',
       }));
     } catch {

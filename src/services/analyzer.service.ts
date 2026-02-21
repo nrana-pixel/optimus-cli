@@ -217,17 +217,40 @@ function walk(
   root: string,
   ignorePatterns: string[],
   files: FileAnalysis[],
+  visited: Set<string> = new Set(),
 ): TreeNode {
   const name     = basename(dir);
   const node: TreeNode = { name, type: 'dir', children: [] };
   let entries: string[] = [];
 
+  // Cycle detection for symlinks
+  let realDir: string;
+  try {
+    realDir = resolve(dir);
+    if (visited.has(realDir)) return node;
+    visited.add(realDir);
+  } catch {
+    return node;
+  }
+
   try { entries = readdirSync(dir); } catch { return node; }
 
+  // Cache stat results to avoid redundant calls during sort
+  const entryStats = new Map<string, { isDir: boolean; stat: ReturnType<typeof statSync> }>();
+  for (const entry of entries) {
+    try {
+      const st = statSync(join(dir, entry));
+      entryStats.set(entry, { isDir: st.isDirectory(), stat: st });
+    } catch {
+      // skip entries we can't stat
+    }
+  }
+
+  // Filter to only statable entries and sort
+  entries = entries.filter(e => entryStats.has(e));
   entries.sort((a, b) => {
-    // dirs first, then files, both alphabetical
-    const aIsDir = statSync(join(dir, a)).isDirectory();
-    const bIsDir = statSync(join(dir, b)).isDirectory();
+    const aIsDir = entryStats.get(a)!.isDir;
+    const bIsDir = entryStats.get(b)!.isDir;
     if (aIsDir !== bIsDir) return aIsDir ? -1 : 1;
     return a.localeCompare(b);
   });
@@ -239,9 +262,9 @@ function walk(
     if (isIgnored(rel, ignorePatterns) || isIgnored(entry, ignorePatterns)) continue;
 
     try {
-      const st = statSync(abs);
-      if (st.isDirectory()) {
-        const child = walk(abs, root, ignorePatterns, files);
+      const { isDir } = entryStats.get(entry)!;
+      if (isDir) {
+        const child = walk(abs, root, ignorePatterns, files, visited);
         if (child.children && child.children.length > 0) {
           node.children!.push(child);
         }

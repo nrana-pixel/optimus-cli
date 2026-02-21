@@ -13,11 +13,6 @@ export interface AppConfig {
   apiUrl: string;
   debug: boolean;
   logLevel: string;
-  dbHost: string;
-  dbPort: number;
-  dbName: string;
-  dbUser: string;
-  dbPassword: string;
 }
 
 export class Config {
@@ -27,11 +22,6 @@ export class Config {
       apiUrl: process.env.API_URL || 'https://api.example.com',
       debug: process.env.DEBUG === 'true',
       logLevel: process.env.LOG_LEVEL || 'info',
-      dbHost: process.env.DB_HOST || 'localhost',
-      dbPort: parseInt(process.env.DB_PORT || '5432', 10),
-      dbName: process.env.DB_NAME || 'cli_project',
-      dbUser: process.env.DB_USER || 'user',
-      dbPassword: process.env.DB_PASSWORD || 'password',
     };
   }
 
@@ -39,3 +29,4 @@ export class Config {
     return this.getConfig()[key];
   }
 }
+

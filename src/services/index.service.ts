@@ -1,39 +1,26 @@
 /**
  * IndexService — Phase 3: Persistent Symbol Index + Repo Map
  *
- * Two main capabilities:
- *
- * 1. SYMBOL INDEX (SQLite-backed, hash-cached)
- *    Parses TypeScript/JavaScript/Python/Go files and stores symbols in a local DB.
- *    Only re-indexes files that have changed (hash comparison → fast startup).
- *
- * 2. REPO MAP (Aider-style)
- *    Generates a compact, human-readable index of every symbol in the project.
- *    ~2-5KB max. Injected into the system prompt so the LLM always knows the full
- *    codebase structure without needing a `list_dir` / `read_file` first.
- *
- * 3. SEMANTIC SEARCH (Embedding-based)
- *    Chunks files into ~512-token blocks, embeds them using the configured LLM
- *    provider's embedding endpoint, and stores vectors in SQLite.
- *    At query time: embeds the question, does cosine similarity search, returns
- *    top-K most relevant code chunks.
+ * Pure-JavaScript implementation using JSON file storage.
+ * No native dependencies — works on any platform without compilation.
  *
  * Storage: ~/.multi-agent/index/<project-hash>/
- *   - symbols.db   (SQLite: files, symbols, imports, embeddings)
+ *   - files.json      (indexed files with hashes)
+ *   - symbols.json    (extracted symbols)
+ *   - embeddings.json (semantic search vectors, created on demand)
  */
 
-import Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 import {
-  existsSync, readFileSync, statSync, readdirSync, mkdirSync, writeFileSync,
+  existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync,
 } from 'fs';
-import { join, relative, extname, dirname } from 'path';
+import { join, relative, extname } from 'path';
 import { homedir } from 'os';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface IndexedFile {
-  path:     string;  // relative to project root
+  path:     string;
   hash:     string;
   mtime:    number;
   language: string;
@@ -50,6 +37,15 @@ export interface IndexedSymbol {
   line:      number;
 }
 
+export interface EmbeddingRecord {
+  id:         number;
+  file:       string;
+  start_line: number;
+  end_line:   number;
+  chunk_text: string;
+  vector:     number[];
+}
+
 export interface SearchResult {
   file:    string;
   lines:   string;
@@ -57,7 +53,7 @@ export interface SearchResult {
   score:   number;
 }
 
-// ─── Language parsers ────────────────────────────────────────────────────────
+// ─── Language map ─────────────────────────────────────────────────────────────
 
 const LANG_MAP: Record<string, string> = {
   '.ts': 'typescript', '.tsx': 'typescript',
@@ -68,7 +64,7 @@ const LANG_MAP: Record<string, string> = {
   '.rb': 'ruby',
   '.java': 'java',
   '.cs': 'csharp',
-  '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp',
+  '.cpp': 'cpp', '.cc': 'cpp',
   '.c': 'c',
   '.php': 'php',
   '.swift': 'swift',
@@ -80,268 +76,241 @@ const SKIP_DIRS = new Set([
   'coverage', '__pycache__', '.venv', 'venv', 'target', 'bin', 'obj',
 ]);
 
-const MAX_FILE_SIZE_BYTES = 300_000;  // 300 KB
+const MAX_FILE_SIZE_BYTES = 300_000;
 const MAX_FILES_TO_INDEX  = 2_000;
 
-// ─── Symbol extractors (regex-based, cross-platform) ────────────────────────
+// ─── Symbol extractor (regex, cross-platform) ────────────────────────────────
 
 function extractSymbols(content: string, filePath: string, lang: string): IndexedSymbol[] {
   const symbols: IndexedSymbol[] = [];
   const lines = content.split('\n');
 
-  const addSymbol = (
-    name: string, kind: IndexedSymbol['kind'],
-    sig: string, lineNum: number,
-  ) => symbols.push({ name, kind, signature: sig.slice(0, 200), file: filePath, line: lineNum });
+  const add = (name: string, kind: IndexedSymbol['kind'], sig: string, ln: number) =>
+    symbols.push({ name, kind, signature: sig.slice(0, 200), file: filePath, line: ln });
 
   if (lang === 'typescript' || lang === 'javascript') {
     lines.forEach((line, i) => {
-      const l = line.trim();
-      const ln = i + 1;
+      const l = line.trim(); const ln = i + 1;
+      let m: RegExpMatchArray | null;
 
-      // class Foo / class Foo extends Bar
-      let m = l.match(/^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/);
-      if (m) { addSymbol(m[1], 'class', l, ln); return; }
-
-      // interface IFoo
-      m = l.match(/^(?:export\s+)?interface\s+(\w+)/);
-      if (m) { addSymbol(m[1], 'interface', l, ln); return; }
-
-      // type FooType = ...
-      m = l.match(/^(?:export\s+)?type\s+(\w+)\s*=/);
-      if (m) { addSymbol(m[1], 'type', l, ln); return; }
-
-      // enum Direction
-      m = l.match(/^(?:export\s+)?(?:const\s+)?enum\s+(\w+)/);
-      if (m) { addSymbol(m[1], 'enum', l, ln); return; }
-
-      // function foo(...)
-      m = l.match(/^(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*[\(<]/);
-      if (m) { addSymbol(m[1], 'function', l, ln); return; }
-
-      // const/let/var foo = (...) => or = function(
-      m = l.match(/^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(/);
-      if (m) { addSymbol(m[1], 'function', l, ln); return; }
-
-      // const/let/var foo =
-      m = l.match(/^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*[=:]/);
-      if (m) { addSymbol(m[1], 'const', l, ln); return; }
-
-      // method inside class: async foo( or foo(
-      m = l.match(/^(?:public|private|protected|static|async|\s)*(?:async\s+)?(\w+)\s*\(/);
-      if (m && !['if','for','while','switch','catch','constructor'].includes(m[1])) {
-        addSymbol(m[1], 'method', l, ln);
+      if ((m = l.match(/^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/))) { add(m[1], 'class', l, ln); return; }
+      if ((m = l.match(/^(?:export\s+)?interface\s+(\w+)/))) { add(m[1], 'interface', l, ln); return; }
+      if ((m = l.match(/^(?:export\s+)?type\s+(\w+)\s*=/))) { add(m[1], 'type', l, ln); return; }
+      if ((m = l.match(/^(?:export\s+)?(?:const\s+)?enum\s+(\w+)/))) { add(m[1], 'enum', l, ln); return; }
+      if ((m = l.match(/^(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*[\(<]/))) { add(m[1], 'function', l, ln); return; }
+      if ((m = l.match(/^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(/))) { add(m[1], 'function', l, ln); return; }
+      if ((m = l.match(/^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*[=:]/))) { add(m[1], 'const', l, ln); return; }
+      if ((m = l.match(/^(?:public|private|protected|static|async|\s)*(?:async\s+)?(\w+)\s*\(/))) {
+        if (!['if','for','while','switch','catch','constructor'].includes(m[1])) add(m[1], 'method', l, ln);
       }
     });
   } else if (lang === 'python') {
     lines.forEach((line, i) => {
-      const l = line.trim();
-      const ln = i + 1;
-      let m = l.match(/^class\s+(\w+)/);
-      if (m) { addSymbol(m[1], 'class', l, ln); return; }
-      m = l.match(/^(?:async\s+)?def\s+(\w+)/);
-      if (m) { addSymbol(m[1], 'function', l, ln); return; }
+      const l = line.trim(); const ln = i + 1;
+      let m: RegExpMatchArray | null;
+      if ((m = l.match(/^class\s+(\w+)/))) { add(m[1], 'class', l, ln); return; }
+      if ((m = l.match(/^(?:async\s+)?def\s+(\w+)/))) { add(m[1], 'function', l, ln); }
     });
   } else if (lang === 'go') {
     lines.forEach((line, i) => {
-      const l = line.trim();
-      const ln = i + 1;
-      let m = l.match(/^type\s+(\w+)\s+struct/);
-      if (m) { addSymbol(m[1], 'class', l, ln); return; }
-      m = l.match(/^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(/);
-      if (m) { addSymbol(m[1], 'function', l, ln); return; }
+      const l = line.trim(); const ln = i + 1;
+      let m: RegExpMatchArray | null;
+      if ((m = l.match(/^type\s+(\w+)\s+struct/))) { add(m[1], 'class', l, ln); return; }
+      if ((m = l.match(/^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(/))) { add(m[1], 'function', l, ln); }
     });
   }
 
   return symbols;
 }
 
+// ─── JsonDb: lightweight JSON-file store ────────────────────────────────────
+
+class JsonDb {
+  private filesData:      Record<string, IndexedFile>  = {};
+  private symbolsData:    IndexedSymbol[]               = [];
+  private embeddingsData: EmbeddingRecord[]             = [];
+  private nextSymId  = 1;
+  private nextEmbId  = 1;
+
+  constructor(
+    private readonly filesPath:      string,
+    private readonly symbolsPath:    string,
+    private readonly embeddingsPath: string,
+  ) {
+    this._load();
+  }
+
+  private _load() {
+    try {
+      if (existsSync(this.filesPath))
+        this.filesData = JSON.parse(readFileSync(this.filesPath, 'utf-8'));
+      if (existsSync(this.symbolsPath)) {
+        this.symbolsData = JSON.parse(readFileSync(this.symbolsPath, 'utf-8'));
+        this.nextSymId = (this.symbolsData[this.symbolsData.length - 1]?.id ?? 0) + 1;
+      }
+      if (existsSync(this.embeddingsPath)) {
+        this.embeddingsData = JSON.parse(readFileSync(this.embeddingsPath, 'utf-8'));
+        this.nextEmbId = (this.embeddingsData[this.embeddingsData.length - 1]?.id ?? 0) + 1;
+      }
+    } catch { /* fresh DB */ }
+  }
+
+  saveFiles()      { writeFileSync(this.filesPath,      JSON.stringify(this.filesData,      null, 0), 'utf-8'); }
+  saveSymbols()    { writeFileSync(this.symbolsPath,    JSON.stringify(this.symbolsData,    null, 0), 'utf-8'); }
+  saveEmbeddings() { writeFileSync(this.embeddingsPath, JSON.stringify(this.embeddingsData, null, 0), 'utf-8'); }
+
+  getFile(path: string): IndexedFile | undefined { return this.filesData[path]; }
+  upsertFile(f: IndexedFile) { this.filesData[f.path] = f; }
+
+  deleteSymbolsForFile(file: string) {
+    this.symbolsData = this.symbolsData.filter(s => s.file !== file);
+  }
+
+  insertSymbol(s: Omit<IndexedSymbol, 'id'>) {
+    this.symbolsData.push({ ...s, id: this.nextSymId++ });
+  }
+
+  searchSymbols(query: string): IndexedSymbol[] {
+    const q = query.toLowerCase();
+    return this.symbolsData.filter(s =>
+      s.name.toLowerCase().includes(q) || s.signature.toLowerCase().includes(q)
+    ).slice(0, 30);
+  }
+
+  lookupSymbol(name: string): IndexedSymbol[] {
+    const exact = this.symbolsData.filter(s => s.name === name);
+    if (exact.length > 0) return exact;
+    const q = name.toLowerCase();
+    return this.symbolsData.filter(s => s.name.toLowerCase().includes(q)).slice(0, 20);
+  }
+
+  getSymbolsForFile(file: string): IndexedSymbol[] {
+    return this.symbolsData.filter(s => s.file === file).sort((a, b) => a.line - b.line);
+  }
+
+  allFiles(): IndexedFile[] { return Object.values(this.filesData); }
+  allSymbols(): IndexedSymbol[] { return this.symbolsData; }
+
+  fileCounts() { return Object.keys(this.filesData).length; }
+  symbolCounts() { return this.symbolsData.length; }
+  embeddingCounts() { return this.embeddingsData.length; }
+
+  clearEmbeddings() { this.embeddingsData = []; this.nextEmbId = 1; }
+  insertEmbedding(e: Omit<EmbeddingRecord, 'id'>) {
+    this.embeddingsData.push({ ...e, id: this.nextEmbId++ });
+  }
+  allEmbeddings(): EmbeddingRecord[] { return this.embeddingsData; }
+}
+
 // ─── IndexService ─────────────────────────────────────────────────────────────
 
 export class IndexService {
-  private db!: Database.Database;
-  private projectRoot: string;
-  private dbPath: string;
+  private db: JsonDb;
+  private readonly projectRoot: string;
 
   constructor(projectRoot: string) {
     this.projectRoot = projectRoot;
     const projectHash = createHash('sha1').update(projectRoot).digest('hex').slice(0, 8);
     const indexDir = join(homedir(), '.multi-agent', 'index', projectHash);
     if (!existsSync(indexDir)) mkdirSync(indexDir, { recursive: true });
-    this.dbPath = join(indexDir, 'symbols.db');
-    this._openDb();
-  }
 
-  private _openDb() {
-    this.db = new Database(this.dbPath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
-
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS files (
-        path      TEXT PRIMARY KEY,
-        hash      TEXT,
-        mtime     INTEGER,
-        language  TEXT,
-        lines     INTEGER,
-        size      INTEGER
-      );
-
-      CREATE TABLE IF NOT EXISTS symbols (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        name      TEXT,
-        kind      TEXT,
-        signature TEXT,
-        file      TEXT REFERENCES files(path) ON DELETE CASCADE,
-        line      INTEGER
-      );
-
-      CREATE TABLE IF NOT EXISTS embeddings (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        file       TEXT,
-        start_line INTEGER,
-        end_line   INTEGER,
-        chunk_text TEXT,
-        vector     TEXT   -- JSON float array
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name);
-      CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file);
-      CREATE INDEX IF NOT EXISTS idx_emb_file ON embeddings(file);
-    `);
+    this.db = new JsonDb(
+      join(indexDir, 'files.json'),
+      join(indexDir, 'symbols.json'),
+      join(indexDir, 'embeddings.json'),
+    );
   }
 
   // ─── Indexing ──────────────────────────────────────────────────────────────
 
-  /** Walk the project and re-index changed files. Returns stats. */
   async buildIndex(onProgress?: (msg: string) => void): Promise<{ files: number; symbols: number; skipped: number }> {
     const allFiles = this._collectFiles(this.projectRoot);
-    let indexed = 0, skipped = 0, totalSymbols = 0;
+    let indexed = 0, skipped = 0, totalNewSymbols = 0;
 
-    const insertFile = this.db.prepare(`
-      INSERT OR REPLACE INTO files (path, hash, mtime, language, lines, size)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    const deleteSymbols = this.db.prepare(`DELETE FROM symbols WHERE file = ?`);
-    const insertSymbol  = this.db.prepare(`
-      INSERT INTO symbols (name, kind, signature, file, line)
-      VALUES (?, ?, ?, ?, ?)
-    `);
+    for (const abs of allFiles) {
+      const rel  = relative(this.projectRoot, abs);
+      const ext  = extname(abs).toLowerCase();
+      const lang = LANG_MAP[ext] || 'text';
 
-    const doIndexBatch = this.db.transaction((files: string[]) => {
-      for (const abs of files) {
-        const rel = relative(this.projectRoot, abs);
-        const ext = extname(abs).toLowerCase();
-        const lang = LANG_MAP[ext] || 'text';
+      let st;
+      try { st = statSync(abs); } catch { skipped++; continue; }
+      if (st.size > MAX_FILE_SIZE_BYTES) { skipped++; continue; }
 
-        const st = statSync(abs);
-        if (st.size > MAX_FILE_SIZE_BYTES) { skipped++; continue; }
+      let content: string;
+      try { content = readFileSync(abs, 'utf-8'); } catch { skipped++; continue; }
 
-        const content = readFileSync(abs, 'utf-8');
-        const hash = createHash('sha1').update(content).digest('hex');
+      const hash = createHash('sha1').update(content).digest('hex');
 
-        // Check if already indexed with same hash
-        const existing = this.db.prepare('SELECT hash FROM files WHERE path = ?').get(rel) as any;
-        if (existing?.hash === hash) { skipped++; continue; }
+      const existing = this.db.getFile(rel);
+      if (existing?.hash === hash) { skipped++; continue; }
 
-        // Index this file
-        const lines = content.split('\n').length;
-        insertFile.run(rel, hash, st.mtimeMs, lang, lines, st.size);
+      // Re-index this file
+      this.db.upsertFile({ path: rel, hash, mtime: st.mtimeMs, language: lang, lines: content.split('\n').length, size: st.size });
+      this.db.deleteSymbolsForFile(rel);
 
-        deleteSymbols.run(rel);
-        const symbols = extractSymbols(content, rel, lang);
-        for (const s of symbols) {
-          insertSymbol.run(s.name, s.kind, s.signature, s.file, s.line);
-        }
-        totalSymbols += symbols.length;
-        indexed++;
-      }
-    });
+      const symbols = extractSymbols(content, rel, lang);
+      for (const s of symbols) this.db.insertSymbol(s);
+      totalNewSymbols += symbols.length;
+      indexed++;
+    }
 
-    doIndexBatch(allFiles);
+    // Persist after full walk
+    this.db.saveFiles();
+    this.db.saveSymbols();
 
-    onProgress?.(`Indexed ${indexed} files, ${totalSymbols} symbols (${skipped} unchanged)`);
-    return { files: indexed, symbols: totalSymbols, skipped };
+    onProgress?.(`Indexed ${indexed} files, ${totalNewSymbols} new symbols (${skipped} unchanged)`);
+    return { files: indexed, symbols: totalNewSymbols, skipped };
   }
 
-  // ─── Repo Map (Aider-style) ───────────────────────────────────────────────
+  // ─── Repo Map ─────────────────────────────────────────────────────────────
 
-  /**
-   * Generate a compact repo map:
-   * Returns a ~2-5KB text block listing all files and their symbols.
-   * Injected into the system prompt so the LLM always knows the codebase.
-   */
   generateRepoMap(maxTokensApprox = 3000): string {
-    const files = this.db.prepare(`
-      SELECT f.path, f.language, f.lines, GROUP_CONCAT(s.kind || ':' || s.name, '|') as syms
-      FROM files f
-      LEFT JOIN symbols s ON s.file = f.path
-      GROUP BY f.path
-      ORDER BY f.path
-    `).all() as Array<{ path: string; language: string; lines: number; syms: string | null }>;
+    const allFiles  = this.db.allFiles();
+    const allSyms   = this.db.allSymbols();
+    if (allFiles.length === 0) return '';
 
-    if (files.length === 0) return '';
+    // Group symbols by file
+    const byFile = new Map<string, IndexedSymbol[]>();
+    for (const s of allSyms) {
+      if (!byFile.has(s.file)) byFile.set(s.file, []);
+      byFile.get(s.file)!.push(s);
+    }
 
     const lines: string[] = ['## Repo Map\n'];
     let charCount = 20;
-    const CHAR_BUDGET = maxTokensApprox * 4; // rough 4 chars/token
+    const CHAR_BUDGET = maxTokensApprox * 4;
 
-    for (const file of files) {
+    const sorted = [...allFiles].sort((a, b) => a.path.localeCompare(b.path));
+
+    for (const file of sorted) {
       if (charCount > CHAR_BUDGET) {
-        lines.push(`... (${files.length - lines.length} more files)`);
+        lines.push(`... (${sorted.length - lines.length} more files)`);
         break;
       }
+      lines.push(`${file.path}:`);
+      charCount += file.path.length + 2;
 
-      const header = `${file.path}:`;
-      lines.push(header);
-      charCount += header.length + 1;
-
-      if (file.syms) {
-        const symbols = file.syms.split('|').slice(0, 20); // max 20 symbols per file
-        for (const s of symbols) {
-          const [kind, name] = s.split(':');
-          const row = `  ${kind.padEnd(10)} ${name}`;
-          lines.push(row);
-          charCount += row.length + 1;
-        }
+      const syms = (byFile.get(file.path) ?? []).slice(0, 20);
+      for (const s of syms) {
+        const row = `  ${s.kind.padEnd(10)} ${s.name}`;
+        lines.push(row);
+        charCount += row.length + 1;
       }
     }
 
     return lines.join('\n') + '\n';
   }
 
-  // ─── Symbol Lookup ─────────────────────────────────────────────────────────
+  // ─── Symbol lookup ─────────────────────────────────────────────────────────
 
-  /** Lookup a symbol by exact name */
-  lookupSymbol(name: string): IndexedSymbol[] {
-    return this.db.prepare(`
-      SELECT * FROM symbols WHERE name = ? OR name LIKE ?
-      LIMIT 20
-    `).all(name, `%${name}%`) as IndexedSymbol[];
-  }
+  lookupSymbol(name: string): IndexedSymbol[]   { return this.db.lookupSymbol(name); }
+  searchSymbols(query: string): IndexedSymbol[] { return this.db.searchSymbols(query); }
+  getFileSymbols(filePath: string): IndexedSymbol[] { return this.db.getSymbolsForFile(filePath); }
 
-  /** Search symbols by partial name */
-  searchSymbols(query: string): IndexedSymbol[] {
-    return this.db.prepare(`
-      SELECT * FROM symbols
-      WHERE name LIKE ? OR signature LIKE ?
-      LIMIT 30
-    `).all(`%${query}%`, `%${query}%`) as IndexedSymbol[];
-  }
+  // ─── Semantic Search ───────────────────────────────────────────────────────
 
-  /** Get all symbols in a file */
-  getFileSymbols(filePath: string): IndexedSymbol[] {
-    return this.db.prepare(`
-      SELECT * FROM symbols WHERE file = ? ORDER BY line
-    `).all(filePath) as IndexedSymbol[];
-  }
-
-  // ─── Semantic Search (Embedding-based) ────────────────────────────────────
-
-  /** Chunk text into overlapping blocks (~512 tokens each) */
-  private _chunkFile(content: string, filePath: string): Array<{ file: string; start: number; end: number; text: string }> {
-    const CHUNK_LINES = 40;   // ~512 tokens
-    const OVERLAP     = 5;    // line overlap
+  private _chunkFile(content: string, filePath: string) {
+    const CHUNK_LINES = 40, OVERLAP = 5;
     const lineArr = content.split('\n');
     const chunks = [];
     for (let start = 0; start < lineArr.length; start += CHUNK_LINES - OVERLAP) {
@@ -353,62 +322,45 @@ export class IndexService {
     return chunks;
   }
 
-  /**
-   * Build embeddings for the whole project using the provided embedding function.
-   * The embedFn receives a text string and returns a float[] vector.
-   */
   async buildEmbeddings(
     embedFn: (text: string) => Promise<number[]>,
     onProgress?: (done: number, total: number) => void,
   ): Promise<number> {
-    const files = this.db.prepare('SELECT path FROM files').all() as Array<{ path: string }>;
-    const insertEmb = this.db.prepare(`
-      INSERT OR REPLACE INTO embeddings (file, start_line, end_line, chunk_text, vector)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    this.db.prepare('DELETE FROM embeddings').run();
-
+    this.db.clearEmbeddings();
+    const files = this.db.allFiles();
     let done = 0;
+
     for (const { path: rel } of files) {
       const abs = join(this.projectRoot, rel);
       if (!existsSync(abs)) continue;
       const content = readFileSync(abs, 'utf-8');
-      const chunks = this._chunkFile(content, rel);
-
+      const chunks  = this._chunkFile(content, rel);
       for (const chunk of chunks) {
         const vec = await embedFn(`FILE: ${chunk.file}\nLINES: ${chunk.start}-${chunk.end}\n${chunk.text}`);
-        insertEmb.run(chunk.file, chunk.start, chunk.end, chunk.text, JSON.stringify(vec));
+        this.db.insertEmbedding({ file: chunk.file, start_line: chunk.start, end_line: chunk.end, chunk_text: chunk.text, vector: vec });
         done++;
         onProgress?.(done, -1);
       }
     }
 
+    this.db.saveEmbeddings();
     return done;
   }
 
-  /**
-   * Semantic search: embed query, find top-K similar chunks using cosine similarity.
-   */
   async semanticSearch(
     query: string,
     embedFn: (text: string) => Promise<number[]>,
     topK = 5,
   ): Promise<SearchResult[]> {
     const queryVec = await embedFn(query);
-    const rows = this.db.prepare(`
-      SELECT file, start_line, end_line, chunk_text, vector FROM embeddings
-    `).all() as Array<{ file: string; start_line: number; end_line: number; chunk_text: string; vector: string }>;
+    const rows = this.db.allEmbeddings();
 
-    const scored = rows.map(row => {
-      const vec: number[] = JSON.parse(row.vector);
-      const score = this._cosine(queryVec, vec);
-      return {
-        file:  row.file,
-        lines: `${row.start_line}-${row.end_line}`,
-        chunk: row.chunk_text,
-        score,
-      };
-    });
+    const scored = rows.map(row => ({
+      file:  row.file,
+      lines: `${row.start_line}-${row.end_line}`,
+      chunk: row.chunk_text,
+      score: this._cosine(queryVec, row.vector),
+    }));
 
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, topK);
@@ -417,30 +369,27 @@ export class IndexService {
   private _cosine(a: number[], b: number[]): number {
     if (a.length !== b.length) return 0;
     let dot = 0, magA = 0, magB = 0;
-    for (let i = 0; i < a.length; i++) {
-      dot  += a[i] * b[i];
-      magA += a[i] * a[i];
-      magB += b[i] * b[i];
-    }
+    for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; magA += a[i]*a[i]; magB += b[i]*b[i]; }
     const denom = Math.sqrt(magA) * Math.sqrt(magB);
     return denom === 0 ? 0 : dot / denom;
   }
 
-  // ─── Stats ─────────────────────────────────────────────────────────────────
+  // ─── Stats ──────────────────────────────────────────────────────────────
 
-  getStats(): { files: number; symbols: number; embeddings: number } {
-    const files      = (this.db.prepare('SELECT COUNT(*) AS c FROM files').get() as any).c;
-    const symbols    = (this.db.prepare('SELECT COUNT(*) AS c FROM symbols').get() as any).c;
-    const embeddings = (this.db.prepare('SELECT COUNT(*) AS c FROM embeddings').get() as any).c;
-    return { files, symbols, embeddings };
+  getStats() {
+    return {
+      files:      this.db.fileCounts(),
+      symbols:    this.db.symbolCounts(),
+      embeddings: this.db.embeddingCounts(),
+    };
   }
 
-  // ─── File collector ────────────────────────────────────────────────────────
+  // ─── File walker ──────────────────────────────────────────────────────────
 
   private _collectFiles(dir: string): string[] {
     const result: string[] = [];
     const walk = (current: string, depth = 0) => {
-      if (depth > 10) return;
+      if (depth > 10 || result.length >= MAX_FILES_TO_INDEX) return;
       let entries: string[];
       try { entries = readdirSync(current); } catch { return; }
       for (const entry of entries) {
@@ -448,25 +397,19 @@ export class IndexService {
         const abs = join(current, entry);
         let st;
         try { st = statSync(abs); } catch { continue; }
-        if (st.isDirectory()) { walk(abs, depth + 1); }
-        else if (st.isFile() && LANG_MAP[extname(entry).toLowerCase()]) {
-          result.push(abs);
-          if (result.length >= MAX_FILES_TO_INDEX) return;
-        }
+        if (st.isDirectory()) walk(abs, depth + 1);
+        else if (st.isFile() && LANG_MAP[extname(entry).toLowerCase()]) result.push(abs);
       }
     };
     walk(dir);
     return result;
   }
 
-  close() {
-    this.db.close();
-  }
+  close() { /* no-op — JSON writes are synchronous */ }
 }
 
-// ─── Embedding provider helpers ───────────────────────────────────────────────
+// ─── Embedding helpers ────────────────────────────────────────────────────────
 
-/** OpenAI-compatible embedding (works with OpenAI, OpenRouter, and local models with /v1/embeddings) */
 export async function openaiEmbed(text: string, apiKey: string, model = 'text-embedding-3-small', baseUrl = 'https://api.openai.com/v1'): Promise<number[]> {
   const res = await fetch(`${baseUrl}/embeddings`, {
     method: 'POST',
@@ -478,7 +421,6 @@ export async function openaiEmbed(text: string, apiKey: string, model = 'text-em
   return data.data[0].embedding;
 }
 
-/** Google Gemini embedding */
 export async function geminiEmbed(text: string, apiKey: string): Promise<number[]> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
   const res = await fetch(url, {

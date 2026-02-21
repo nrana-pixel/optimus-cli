@@ -138,7 +138,14 @@ export class MCPService {
       { capabilities: {} }
     );
 
-    await client.connect(transport);
+    // Connect with a timeout to prevent hanging on unresponsive servers
+    const CONNECT_TIMEOUT_MS = 15_000;
+    await Promise.race([
+      client.connect(transport),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`MCP server '${config.name}' connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s`)), CONNECT_TIMEOUT_MS)
+      ),
+    ]);
 
     // Discover tools
     const result = await client.listTools();

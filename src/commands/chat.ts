@@ -8,7 +8,8 @@ import { LocalModelService } from '../services/local-model.service.js';
 import { MCPService } from '../services/mcp.service.js';
 import { IndexService, geminiEmbed, openaiEmbed } from '../services/index.service.js';
 import type { LocalModel } from '../types/local-model.js';
-import { resolve } from 'path';
+import { resolve, extname as pathExtname } from 'path';
+import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from 'fs';
 
 // ─── ANSI / terminal helpers ─────────────────────────────────────────────────
 
@@ -561,19 +562,19 @@ export default class Chat extends Command {
 
   /** Build the symbol index in the background — doesn't block startup */
   private _buildIndexBackground() {
-    setImmediate(async () => {
+    setTimeout(async () => {
       try {
         this.indexService = new IndexService(resolve('.'));
         const stats = await this.indexService.buildIndex();
         if (stats.files > 0 || this.repoMap === '') {
           this.repoMap = this.indexService.generateRepoMap();
-          // Quiet confirm printed on next line after prompt is ready
+          // Only notify if the prompt is not actively receiving input
           Spinner.notify(`  🗂  Index ready — ${stats.files + stats.skipped} files, ${stats.symbols} new symbols`);
         }
       } catch (err: any) {
         // Non-fatal — just skip indexing silently
       }
-    });
+    }, 1500);  // Delay to let the prompt stabilize first
   }
 
   /** Get an embed function based on the current provider config */
@@ -661,20 +662,19 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
     }
 
     let payloadContent: string | any[] = cleanLine;
-    const validImages = [];
+    const validImages: string[] = [];
 
     // Verify files exist
-    const fs = require('fs');
-    for (const p of imagePaths) {
-      if (fs.existsSync(p)) validImages.push(p);
+    for (const imgPath of imagePaths) {
+      if (fsExistsSync(imgPath)) validImages.push(imgPath);
     }
 
     if (validImages.length > 0) {
       const parts: any[] = [{ type: 'text', text: cleanLine || 'What is in this image?' }];
       for (const imgPath of validImages) {
-        const ext = require('path').extname(imgPath).toLowerCase().slice(1);
+        const ext = pathExtname(imgPath).toLowerCase().slice(1);
         const mime = ext === 'jpg' ? 'jpeg' : ext;
-        const b64 = fs.readFileSync(imgPath).toString('base64');
+        const b64 = fsReadFileSync(imgPath).toString('base64');
         parts.push({ type: 'image_url', image_url: { url: `data:image/${mime};base64,${b64}` } });
       }
       payloadContent = parts;
@@ -692,8 +692,9 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
       if (plan) {
         // Inject plan as a hidden system note — not shown to user, only to LLM
         this.msgs.push({
-          role: 'assistant',
-          content: `[PLANNER NOTE — internal, not shown to user]\n${plan}`,
+          role: 'system',
+          content: `[PLANNER NOTE]
+${plan}`,
         });
       }
     }
@@ -773,7 +774,14 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
         let filterIn  = false;
 
         const filterChunk = (chunk: string) => {
-          filterBuf += chunk;
+          let text = chunk;
+          
+          // Silently drop planner notes from streaming output
+          if (text.includes('[PLANNER NOTE')) {
+            text = text.replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '');
+          }
+
+          filterBuf += text;
           let out = '';
           while (filterBuf.length > 0) {
             if (!filterIn) {
@@ -810,7 +818,10 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
         firstContent();
         if (!full) {
           full = res.content;
-          const clean = full.replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '').trim();
+          const clean = full
+            .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
+            .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
+            .trim();
           if (clean) o(clean);
           this.tokens += res.tokensUsed.total;
           this.cost   += res.cost.total;
@@ -899,9 +910,16 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
         o(p(A.gr + A.b, `  └${HR}┘\n\n`));
       }
 
-      this.msgs.push({ role: 'assistant', content: fullFinal });
-      this.conv.addMessage('assistant', fullFinal);
-      this.conv.updateMetadata(0, 0);
+      // ── Clean final message for UI & History ──
+      // Drop tool calls and planner notes from the string that is saved to conversation history
+      let saveString = fullFinal
+        .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
+        .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
+        .trim();
+
+      this.msgs.push({ role: 'assistant', content: saveString });
+      this.conv.addMessage('assistant', saveString);
+      this.conv.updateMetadata(this.tokens, this.cost);
       this.conv.saveSession();
       this._statusLine();
 
@@ -953,12 +971,22 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
       case '/history': {
         if (!this.msgs.length) { o(p(A.gy, '  No messages yet.\n')); break; }
         o(p(A.gy, '  ' + '─'.repeat(50) + '\n'));
-        this.msgs.forEach((m, i) => {
+        // Filter out internal messages (planner notes, tool results)
+        const visibleMsgs = this.msgs.filter((m) => {
+          if (m.role === 'system') return false;
+          const text = Array.isArray(m.content)
+            ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : m.content;
+          if (text.includes('[PLANNER NOTE')) return false;
+          if (text.includes('<tool_result>')) return false;
+          return true;
+        });
+        visibleMsgs.forEach((m, i) => {
           const who = m.role === 'user'
             ? p(A.cy + A.b, '[You]    ')
             : p(A.ye + A.b, '[Optimus]');
           const textOnly = Array.isArray(m.content) 
-            ? m.content.filter(c => c.type === 'text').map(c => c.text).join('\n') 
+            ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n') 
             : m.content;
           const txt = textOnly.length > 200 ? textOnly.slice(0, 200) + '…' : textOnly;
           const indented = txt.replace(/\n/g, '\n           ');
@@ -1382,6 +1410,10 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
         if (!this.indexService) {
           this.indexService = new IndexService(resolve('.'));
         }
+
+        // Check for --embed flag
+        const doEmbed = rest.includes('--embed');
+
         const ts = new Spinner('Indexing');
         ts.start();
         try {
@@ -1397,7 +1429,28 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
           o(p(A.mg + A.b, '  │') + p(A.gy, `  ✔ ${stats.files} files newly indexed`) + '\n');
           o(p(A.mg + A.b, '  │') + p(A.gy, `  ✔ ${stats.skipped} files unchanged (cached)`) + '\n');
           o(p(A.mg + A.b, '  │') + p(A.gy, `  ✔ ${dbStats.symbols} total symbols indexed`) + '\n');
+
+          // Handle --embed flag for semantic search embeddings
+          if (doEmbed) {
+            const embedFn = this._getEmbedFn();
+            if (embedFn) {
+              o(p(A.mg + A.b, '  │') + p(A.cy, `  ✴ Building embeddings...`) + '\n');
+              try {
+                const embeddedCount = await this.indexService.buildEmbeddings(embedFn);
+                o(p(A.mg + A.b, '  │') + p(A.gr, `  ✔ ${embeddedCount} chunks embedded`) + '\n');
+              } catch (embedErr: any) {
+                o(p(A.mg + A.b, '  │') + p(A.re, `  ✖ Embedding failed: ${embedErr.message}`) + '\n');
+              }
+            } else {
+              o(p(A.mg + A.b, '  │') + p(A.ye, `  ⚠ No embedding function available for provider ${ConfigService.loadConfig().apiProvider}`) + '\n');
+            }
+          }
+
           o(p(A.mg + A.b, `  └${HR}┘\n`));
+
+          if (!doEmbed) {
+            o(p(A.gy, '  Tip: Run /index --embed to enable semantic search.\n'));
+          }
         } catch (e: any) {
           ts.stop('Optimus');
           o(p(A.re, `  ⚠  Indexing failed: ${e.message}\n`));

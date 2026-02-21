@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * LLM Service with LiteLLM (OPTIONAL)
  * Alternative implementation using LiteLLM for unified API access
@@ -44,22 +43,26 @@ export class LLMServiceLiteLLM {
   private provider: 'openai' | 'anthropic' | 'gemini';
   private model: string;
 
-  // Pricing per 1M tokens (as of 2024)
-  private static readonly PRICING = {
+  // Pricing per 1M tokens (updated 2025)
+  private static readonly PRICING: Record<string, Record<string, { input: number; output: number }>> = {
     openai: {
-      'gpt-4': { input: 0.03, output: 0.06 },
-      'gpt-4-turbo': { input: 0.01, output: 0.03 },
-      'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 },
+      'gpt-4': { input: 30, output: 60 },
+      'gpt-4-turbo': { input: 10, output: 30 },
+      'gpt-4o': { input: 2.5, output: 10 },
+      'gpt-4o-mini': { input: 0.15, output: 0.6 },
+      'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
     },
     anthropic: {
-      'claude-3-opus': { input: 0.015, output: 0.075 },
-      'claude-3-sonnet': { input: 0.003, output: 0.015 },
-      'claude-3-haiku': { input: 0.00025, output: 0.00125 },
+      'claude-3-opus': { input: 15, output: 75 },
+      'claude-3-5-sonnet-20241022': { input: 3, output: 15 },
+      'claude-3-sonnet': { input: 3, output: 15 },
+      'claude-3-haiku': { input: 0.25, output: 1.25 },
     },
     gemini: {
       'gemini-2.5-flash': { input: 0.075, output: 0.3 },
       'gemini-2.0-flash': { input: 0.075, output: 0.3 },
-      'gemini-1.5-pro': { input: 0.0075, output: 0.03 },
+      'gemini-1.5-pro': { input: 1.25, output: 5 },
+      'gemini-1.5-flash': { input: 0.075, output: 0.3 },
     },
   };
 
@@ -68,9 +71,13 @@ export class LLMServiceLiteLLM {
     this.provider = config.apiProvider as 'openai' | 'anthropic' | 'gemini';
     this.apiKey = ConfigService.getApiKey();
 
-    // Set default model based on provider
-    if (this.provider === 'openai') {
-      this.model = 'gpt-3.5-turbo';
+    // Read defaultModel from config, fall back to provider defaults
+    const defaultModel = (config as any).defaultModel;
+
+    if (defaultModel) {
+      this.model = defaultModel;
+    } else if (this.provider === 'openai') {
+      this.model = 'gpt-4o-mini';
     } else if (this.provider === 'anthropic') {
       this.model = 'claude-3-haiku';
     } else if (this.provider === 'gemini') {
@@ -112,9 +119,6 @@ export class LLMServiceLiteLLM {
 
   /**
    * Send a message and get a response using LiteLLM
-   * 
-   * Note: This requires litellm to be installed:
-   * pnpm add litellm
    */
   async complete(
     message: string,
@@ -134,13 +138,13 @@ export class LLMServiceLiteLLM {
     messages: Array<{ role: string; content: string | any[] }>,
     callbacks?: LLMStreamCallback
   ): Promise<LLMResponse> {
-    // The JS litellm package does not support Gemini — use native REST for it
+    // Use native REST for Gemini (the JS litellm package does not support it well)
     if (this.provider === 'gemini') {
       return this.completeGeminiNative(messages, callbacks);
     }
 
     try {
-      let litellm;
+      let litellm: any;
       try {
         litellm = await import('litellm');
       } catch (error) {
@@ -151,27 +155,66 @@ export class LLMServiceLiteLLM {
 
       const modelString = this.buildLiteLLMModelString();
 
-      let response;
+      let response: any;
       try {
-        response = await litellm.completion({
-          model: modelString,
-          messages,
-          temperature: 0.7,
-          max_tokens: 4096,
-          stream: false,
-        });
+        if (callbacks?.onChunk) {
+          // Streaming mode
+          response = await litellm.completion({
+            model: modelString,
+            messages,
+            temperature: 0.7,
+            max_tokens: 8192,
+            stream: true,
+          });
+
+          let fullContent = '';
+          let inputTokens = 0;
+          let outputTokens = 0;
+
+          for await (const chunk of response) {
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              fullContent += delta;
+              callbacks.onChunk(delta);
+            }
+            // Track tokens from the final chunk if available
+            if (chunk.usage) {
+              inputTokens = chunk.usage.prompt_tokens || 0;
+              outputTokens = chunk.usage.completion_tokens || 0;
+            }
+          }
+
+          const cost = this.calculateCost(inputTokens, outputTokens);
+          const result: LLMResponse = {
+            content: fullContent,
+            model: this.model,
+            provider: this.provider,
+            tokensUsed: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens },
+            cost,
+            stopReason: 'stop',
+          };
+
+          if (callbacks.onComplete) callbacks.onComplete(result);
+          return result;
+        } else {
+          // Non-streaming mode
+          response = await litellm.completion({
+            model: modelString,
+            messages,
+            temperature: 0.7,
+            max_tokens: 8192,
+            stream: false,
+          });
+
+          const parsed = this.parseLiteLLMResponse(response);
+          if (callbacks?.onComplete) callbacks.onComplete(parsed);
+          return parsed;
+        }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         if (callbacks?.onError) callbacks.onError(new Error(errorMsg));
         throw error;
       }
-
-      const parsed = this.parseLiteLLMResponse(response);
-
-      if (callbacks?.onChunk) callbacks.onChunk(parsed.content);
-      if (callbacks?.onComplete) callbacks.onComplete(parsed);
-
-      return parsed;
     } catch (error) {
       if (callbacks?.onError) callbacks.onError(error as Error);
       throw error;
@@ -179,7 +222,7 @@ export class LLMServiceLiteLLM {
   }
 
   /**
-   * Native Gemini REST API call with multi-turn history support.
+   * Native Gemini REST API call with streaming and multi-turn history support.
    * Converts the OpenAI-style messages array into Gemini's `contents` format.
    */
   private async completeGeminiNative(
@@ -187,17 +230,22 @@ export class LLMServiceLiteLLM {
     callbacks?: LLMStreamCallback
   ): Promise<LLMResponse> {
     try {
-      // Separate system prompt (first message if role === 'system')
-      let systemInstruction: string | undefined;
-      let chatMessages = messages;
+      // Separate ALL system messages and merge them
+      const systemMessages: string[] = [];
+      const chatMessages: Array<{ role: string; content: string | any[] }> = [];
 
-      if (messages.length > 0 && messages[0].role === 'system') {
-        const sysMsg = messages[0].content;
-        systemInstruction = Array.isArray(sysMsg) 
-          ? sysMsg.filter(c => c.type === 'text').map(c => c.text).join('\n') 
-          : sysMsg;
-        chatMessages = messages.slice(1);
+      for (const msg of messages) {
+        if (msg.role === 'system') {
+          const text = Array.isArray(msg.content)
+            ? msg.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : msg.content;
+          systemMessages.push(text);
+        } else {
+          chatMessages.push(msg);
+        }
       }
+
+      const systemInstruction = systemMessages.length > 0 ? systemMessages.join('\n\n') : undefined;
 
       // Convert to Gemini contents format (user → model alternation)
       const contents = chatMessages.map((m) => {
@@ -205,7 +253,7 @@ export class LLMServiceLiteLLM {
         if (typeof m.content === 'string') {
           parts = [{ text: m.content }];
         } else if (Array.isArray(m.content)) {
-          parts = m.content.map(c => {
+          parts = m.content.map((c: any) => {
             if (c.type === 'text') return { text: c.text };
             if (c.type === 'image_url') {
               const match = c.image_url?.url?.match(/^data:(image\/[a-z]+);base64,(.*)$/);
@@ -222,16 +270,22 @@ export class LLMServiceLiteLLM {
         };
       });
 
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
-
       const body: any = {
         contents,
-        generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
+        generationConfig: { temperature: 0.7, maxOutputTokens: 65536 },
       };
 
       if (systemInstruction) {
         body.systemInstruction = { parts: [{ text: systemInstruction }] };
       }
+
+      // Use streaming if onChunk callback is provided
+      if (callbacks?.onChunk) {
+        return await this.streamGeminiNative(body, callbacks);
+      }
+
+      // Non-streaming path
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
 
       const response = await fetch(url, {
         method: 'POST',
@@ -240,13 +294,13 @@ export class LLMServiceLiteLLM {
       });
 
       if (!response.ok) {
-        const errData = await response.json();
+        const errData: any = await response.json();
         const msg = errData?.error?.message || `HTTP ${response.status}`;
         if (callbacks?.onError) callbacks.onError(new Error(msg));
         throw new Error(`Gemini API error: ${msg}`);
       }
 
-      const data = await response.json();
+      const data: any = await response.json();
       const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const inputTokens  = data.usageMetadata?.promptTokenCount     || 0;
       const outputTokens = data.usageMetadata?.candidatesTokenCount || 0;
@@ -261,14 +315,98 @@ export class LLMServiceLiteLLM {
         stopReason: data.candidates?.[0]?.finishReason,
       };
 
-      if (callbacks?.onChunk) callbacks.onChunk(content);
       if (callbacks?.onComplete) callbacks.onComplete(result);
-
       return result;
     } catch (error) {
       if (callbacks?.onError) callbacks.onError(error as Error);
       throw error;
     }
+  }
+
+  /**
+   * Stream Gemini response using streamGenerateContent with SSE
+   */
+  private async streamGeminiNative(
+    body: any,
+    callbacks: LLMStreamCallback
+  ): Promise<LLMResponse> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:streamGenerateContent?alt=sse&key=${this.apiKey}`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errData: any = await response.json();
+      const msg = errData?.error?.message || `HTTP ${response.status}`;
+      if (callbacks.onError) callbacks.onError(new Error(msg));
+      throw new Error(`Gemini API error: ${msg}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('No response body');
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullContent = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let finishReason: string | undefined;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const data = trimmed.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (text) {
+              fullContent += text;
+              if (callbacks.onChunk) callbacks.onChunk(text);
+            }
+            // Track usage from the last chunk
+            if (parsed.usageMetadata) {
+              inputTokens = parsed.usageMetadata.promptTokenCount || 0;
+              outputTokens = parsed.usageMetadata.candidatesTokenCount || 0;
+            }
+            if (parsed.candidates?.[0]?.finishReason) {
+              finishReason = parsed.candidates[0].finishReason;
+            }
+          } catch {
+            // Skip malformed JSON chunks
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const cost = this.calculateCost(inputTokens, outputTokens);
+
+    const result: LLMResponse = {
+      content: fullContent,
+      model: this.model,
+      provider: 'gemini',
+      tokensUsed: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens },
+      cost,
+      stopReason: finishReason,
+    };
+
+    if (callbacks.onComplete) callbacks.onComplete(result);
+    return result;
   }
 
   /**
@@ -312,16 +450,16 @@ export class LLMServiceLiteLLM {
   }
 
   /**
-   * Calculate cost based on tokens and pricing
+   * Calculate cost based on tokens and pricing (pricing is per 1M tokens)
    */
   private calculateCost(inputTokens: number, outputTokens: number): { input: number; output: number; total: number } {
-    const pricing = (LLMServiceLiteLLM.PRICING as any)[this.provider]?.[this.model] || {
-      input: 0.001,
-      output: 0.001,
+    const pricing = LLMServiceLiteLLM.PRICING[this.provider]?.[this.model] || {
+      input: 1,
+      output: 2,
     };
 
-    const inputCost = (inputTokens / 1000000) * pricing.input;
-    const outputCost = (outputTokens / 1000000) * pricing.output;
+    const inputCost = (inputTokens / 1_000_000) * pricing.input;
+    const outputCost = (outputTokens / 1_000_000) * pricing.output;
 
     return {
       input: parseFloat(inputCost.toFixed(6)),
@@ -334,7 +472,7 @@ export class LLMServiceLiteLLM {
    * Get available models for current provider
    */
   getAvailableModels(): string[] {
-    const models = (LLMServiceLiteLLM.PRICING as any)[this.provider];
+    const models = LLMServiceLiteLLM.PRICING[this.provider];
     return models ? Object.keys(models) : [];
   }
 
@@ -343,9 +481,9 @@ export class LLMServiceLiteLLM {
    */
   getPricing(model?: string): { input: number; output: number } {
     const m = model || this.model;
-    return (LLMServiceLiteLLM.PRICING as any)[this.provider]?.[m] || {
-      input: 0.001,
-      output: 0.001,
+    return LLMServiceLiteLLM.PRICING[this.provider]?.[m] || {
+      input: 1,
+      output: 2,
     };
   }
 }

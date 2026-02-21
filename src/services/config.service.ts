@@ -4,7 +4,7 @@
  */
 
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { LocalModel } from '../types/local-model.js';
@@ -169,8 +169,12 @@ export class ConfigService {
    */
   static deleteConfig(): void {
     if (existsSync(this.CONFIG_FILE)) {
-      writeFileSync(this.CONFIG_FILE, '');
-      // In production, securely wipe the file
+      try {
+        unlinkSync(this.CONFIG_FILE);
+      } catch {
+        // Fallback: overwrite with empty JSON so loadConfig doesn't crash
+        writeFileSync(this.CONFIG_FILE, '{}');
+      }
     }
   }
 
@@ -204,8 +208,8 @@ export class ConfigService {
     }
 
     if (provider === 'openai') {
-      // OpenAI keys typically start with 'sk-'
-      return apiKey.startsWith('sk-');
+      // OpenAI keys start with 'sk-' (legacy) or 'sk-proj-' (project keys)
+      return apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-');
     } else if (provider === 'anthropic') {
       // Anthropic keys typically start with 'sk-ant-'
       return apiKey.startsWith('sk-ant-');

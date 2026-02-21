@@ -73,7 +73,7 @@ export interface AgentResult {
 export class AgentOrchestrator {
   private llm:           LLMServiceLiteLLM;
   private analyzer:      AnalyzerService;
-  private ctxBuilder:    ContextBuilderService;
+  private ctxBuilder:    ContextBuilderService | null;
   private taskAnalyzer:  TaskAnalyzerService;
   private git:           GitService;
   private tools:         ToolsService;
@@ -81,7 +81,7 @@ export class AgentOrchestrator {
   constructor(llm: LLMServiceLiteLLM, workingDir: string) {
     this.llm          = llm;
     this.analyzer     = new AnalyzerService();
-    this.ctxBuilder   = new ContextBuilderService({} as any); // re-set after analysis
+    this.ctxBuilder   = null;
     this.taskAnalyzer = new TaskAnalyzerService();
     this.git          = new GitService(workingDir);
     this.tools        = new ToolsService(workingDir);
@@ -146,7 +146,7 @@ export class AgentOrchestrator {
     } else {
       // ── 4a. Simple/Medium: single ReAct loop ───────────────────────
       const step = await this.executeWithTools(task, contextString, null, [], opt, emit, maxToolLoops);
-      this.applyStep(step, result, outputDir, null, emit);
+      await this.applyStep(step, result, outputDir, null, emit);
     }
 
     result.durationMs = Date.now() - startTime;
@@ -197,7 +197,7 @@ export class AgentOrchestrator {
         subtask.description, subtaskContext, subtask, previousResults, opt, emit, maxToolLoops,
       );
 
-      this.applyStep(step, result, resolve(opt.outputDir), subtask, emit);
+      await this.applyStep(step, result, resolve(opt.outputDir), subtask, emit);
 
       previousResults.push({
         subtask,
@@ -297,13 +297,13 @@ export class AgentOrchestrator {
 
   // ─── Apply step results (write files + git commit) ──────────────────────
 
-  private applyStep(
+  private async applyStep(
     step:      StepResult,
     result:    AgentResult,
     outputDir: string,
     subtask:   SubTask | null,
     emit:      (ev: AgentEvent) => void,
-  ): void {
+  ): Promise<void> {
 
     result.steps.push(step);
     result.totalTokens += step.tokens;
@@ -312,26 +312,25 @@ export class AgentOrchestrator {
 
     // Git commit for this step
     if (step.files.length) {
-      this.commitStep(step.files, subtask?.title ?? 'AI changes', result, emit);
+      await this.commitStep(step.files, subtask?.title ?? 'AI changes', result, emit);
     }
   }
 
-  private commitStep(
+  private async commitStep(
     files:   string[],
     title:   string,
     result:  AgentResult,
     emit:    (ev: AgentEvent) => void,
-  ): void {
-    this.git.isGitRepo().then(async isRepo => {
-      if (!isRepo) return;
-      try {
-        await this.git.stageFiles(files);
-        const msg    = `feat: ${title}`;
-        const commit = await this.git.commit(msg);
-        result.commits.push(commit.hash);
-        emit({ type: 'git_commit', message: `${commit.hash} ${msg}` });
-      } catch { /* non-fatal */ }
-    });
+  ): Promise<void> {
+    const isRepo = await this.git.isGitRepo();
+    if (!isRepo) return;
+    try {
+      await this.git.stageFiles(files);
+      const msg    = `feat: ${title}`;
+      const commit = await this.git.commit(msg);
+      result.commits.push(commit.hash);
+      emit({ type: 'git_commit', message: `${commit.hash} ${msg}` });
+    } catch { /* non-fatal */ }
   }
 
   // ─── Code block parser + file writer ────────────────────────────────────

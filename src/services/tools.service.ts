@@ -22,7 +22,7 @@
 
 import {
   existsSync, readFileSync, readdirSync, statSync,
-  writeFileSync, mkdirSync, copyFileSync,
+  writeFileSync, mkdirSync, copyFileSync, unlinkSync,
 } from 'fs';
 import { join, resolve, relative, extname, dirname } from 'path';
 import { execSync } from 'child_process';
@@ -77,11 +77,14 @@ export interface ToolResult {
 // ─── Safety ──────────────────────────────────────────────────────────────────
 
 const BLOCKED_CMD_PATTERNS = [
-  /\brm\b/, /\bdel\b/, /\bformat\b/, /\bmkfs\b/,
+  /\brm\b/, /\bdel\b/, /\berase\b/, /\bformat\b/, /\bmkfs\b/,
   /\bsudo\b/, /\bsu\b/, /\bcurl\b.*\|/, /\bwget\b.*\|/,
   />\s*\//, />\s*[A-Za-z]:\\/, /\bchmod\s+[0-7]*7/,
   /\bkill\b/, /\bpkill\b/, /\bshutdown\b/, /\breboot\b/,
-  /\bnpm\s+publish\b/, /\bgit\s+push\b/, /\bgit\s+reset.*--hard\b/,
+  /\bnpm\s+publish\b/, /\bpnpm\s+publish\b/, /\byarn\s+publish\b/,
+  /\bgit\s+push\b/, /\bgit\s+reset.*--hard\b/,
+  /\bRemove-Item\b/i, /\bStop-Process\b/i, /\bRestart-Computer\b/i,
+  /\bInvoke-WebRequest\b.*\|/i, /\bInvoke-RestMethod\b.*\|/i,
 ];
 
 function isSafeCommand(cmd: string): boolean {
@@ -289,7 +292,11 @@ export class ToolsService {
 
     const oldLines = oldContent.split('\n').length;
     const newLines = newContent.split('\n').length;
-    return `Edited: ${filePath} — replaced ${oldLines} line(s) with ${newLines} line(s)${count > 1 ? ` (first of ${count} occurrences)` : ''}`;
+    let msg = `Edited: ${filePath} — replaced ${oldLines} line(s) with ${newLines} line(s)`;
+    if (count > 1) {
+      msg += ` (WARNING: ${count} occurrences found, only the first was replaced. Use write_file for full control.)`;
+    }
+    return msg;
   }
 
   private listDir(dirPath: string): string {
@@ -351,7 +358,22 @@ export class ToolsService {
         }
 
         const ext = extname(entry).toLowerCase();
-        if (glob && !entry.includes(glob.replace('*', '')) && !glob.includes('*')) continue;
+        // Glob filtering: match against relative path, not just filename
+        if (glob) {
+          const rel = relative(this.workingDir, abs).replace(/\\/g, '/');
+          const globLower = glob.toLowerCase();
+          // Simple glob match: support *.ext and **/*.ext patterns
+          if (globLower.includes('*')) {
+            const parts = globLower.split('*').filter(Boolean);
+            const matchTarget = globLower.includes('/') ? rel.toLowerCase() : entry.toLowerCase();
+            const matches = parts.every(part => matchTarget.includes(part));
+            if (!matches) continue;
+          } else {
+            // No wildcards: check if filename or path contains the glob
+            const rel2 = rel.toLowerCase();
+            if (!rel2.includes(globLower) && !entry.toLowerCase().includes(globLower)) continue;
+          }
+        }
         if (!EXT.has(ext)) continue;
 
         try {
@@ -477,7 +499,6 @@ export class ToolsService {
       } else if (!snap.existed && existsSync(snap.absPath)) {
         // File was newly created — delete it
         try {
-          const { unlinkSync } = require('fs');
           unlinkSync(snap.absPath);
           restored.push(`🗑 Deleted (was new): ${snap.relPath}`);
         } catch { /* skip */ }

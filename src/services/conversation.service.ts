@@ -3,7 +3,7 @@
  * Manages conversation history and session persistence
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -91,7 +91,7 @@ export class ConversationService {
    */
   getLastSession(): ConversationSession | null {
     try {
-      const files = require('fs').readdirSync(ConversationService.SESSIONS_DIR);
+      const files = readdirSync(ConversationService.SESSIONS_DIR);
       if (files.length === 0) {
         return null;
       }
@@ -100,7 +100,7 @@ export class ConversationService {
       const sessions = files
         .map((file: string) => {
           const filePath = join(ConversationService.SESSIONS_DIR, file);
-          const stats = require('fs').statSync(filePath);
+          const stats = statSync(filePath);
           return { file, time: stats.mtimeMs };
         })
         .sort((a: any, b: any) => b.time - a.time);
@@ -206,15 +206,20 @@ export class ConversationService {
    */
   listSessions(): ConversationSession[] {
     try {
-      const files = require('fs').readdirSync(ConversationService.SESSIONS_DIR);
+      const files = readdirSync(ConversationService.SESSIONS_DIR);
       const sessions: ConversationSession[] = [];
 
       for (const file of files) {
         if (file.endsWith('.json')) {
-          const sessionId = file.replace('.json', '');
-          const session = this.loadSession(sessionId);
-          if (session) {
-            sessions.push(session);
+          try {
+            const filePath = join(ConversationService.SESSIONS_DIR, file);
+            const content = readFileSync(filePath, 'utf-8');
+            const session = JSON.parse(content) as ConversationSession;
+            if (session) {
+              sessions.push(session);
+            }
+          } catch {
+            // Skip corrupt session files
           }
         }
       }
@@ -233,7 +238,7 @@ export class ConversationService {
     try {
       const filePath = join(ConversationService.SESSIONS_DIR, `${sessionId}.json`);
       if (existsSync(filePath)) {
-        require('fs').unlinkSync(filePath);
+        unlinkSync(filePath);
         return true;
       }
       return false;

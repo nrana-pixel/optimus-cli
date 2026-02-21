@@ -1,4 +1,4 @@
-aga/**
+/**
  * Type declarations for prompts module
  * This file provides TypeScript support for the prompts library
  */
