@@ -282,9 +282,10 @@ export class IndexService {
 
     const sorted = [...allFiles].sort((a, b) => a.path.localeCompare(b.path));
 
-    for (const file of sorted) {
+    for (let i = 0; i < sorted.length; i++) {
+      const file = sorted[i];
       if (charCount > CHAR_BUDGET) {
-        lines.push(`... (${sorted.length - lines.length} more files)`);
+        lines.push(`... (${sorted.length - i} more files)`);
         break;
       }
       lines.push(`${file.path}:`);
@@ -328,6 +329,20 @@ export class IndexService {
   ): Promise<number> {
     this.db.clearEmbeddings();
     const files = this.db.allFiles();
+
+    // Precompute total chunks for progress UIs.
+    let total = 0;
+    for (const { path: rel } of files) {
+      const abs = join(this.projectRoot, rel);
+      if (!existsSync(abs)) continue;
+      try {
+        const content = readFileSync(abs, 'utf-8');
+        total += this._chunkFile(content, rel).length;
+      } catch {
+        // ignore unreadable files
+      }
+    }
+
     let done = 0;
 
     for (const { path: rel } of files) {
@@ -339,7 +354,7 @@ export class IndexService {
         const vec = await embedFn(`FILE: ${chunk.file}\nLINES: ${chunk.start}-${chunk.end}\n${chunk.text}`);
         this.db.insertEmbedding({ file: chunk.file, start_line: chunk.start, end_line: chunk.end, chunk_text: chunk.text, vector: vec });
         done++;
-        onProgress?.(done, -1);
+        onProgress?.(done, total);
       }
     }
 

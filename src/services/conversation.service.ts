@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'crypto';
 
 export type MessageReaction = 'up' | 'down';
 
@@ -310,7 +311,12 @@ export class ConversationService {
    * Generate a unique session ID
    */
   private generateSessionId(): string {
-    return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    // Prefer UUIDs to avoid collisions and deprecated string APIs.
+    try {
+      return `session-${randomUUID()}`;
+    } catch {
+      return `session-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    }
   }
 
   /**

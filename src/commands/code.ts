@@ -150,6 +150,9 @@ export default class Code extends Command {
           : conv.getLastSession();
         if (session) {
           sessionName = session.name;
+          // Keep metadata in sync with the actual model/provider we will use.
+          session.metadata.provider = configData.apiProvider;
+          session.metadata.model = llm.getModel();
           this.log(`\n📋 Continuing session: ${session.name} (${session.messages.length} messages)`);
         } else {
           conv.createSession(sessionName, configData.apiProvider, llm.getModel());

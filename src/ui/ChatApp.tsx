@@ -108,7 +108,7 @@ export function ChatApp(props: ChatAppProps) {
   }, [stdout]);
 
   const usableHeight = Math.max(10, height - 15);
-  const columns = (process.stdout as any)?.columns ?? 80;
+  const columns = Math.max(20, Number((process.stdout as any)?.columns) || 80);
   const [page, setPage] = useState(0); // deprecated, kept for compatibility but unused
   const [anchorMessageId, setAnchorMessageId] = useState<string | null>(null);
   const [returnState, setReturnState] = useState<null | { scrollOffset: number; threadRootId: string | null; threadLeafId: string | null }>(null);
@@ -145,6 +145,26 @@ export function ChatApp(props: ChatAppProps) {
     }
   }, [state.savedThreadRootId, state.savedThreadLeafId]);
 
+  const viewMessages = useMemo(() => {
+    const allMessages = state.messages;
+    if (!threadRootId) return allMessages;
+    const byId = new Map(allMessages.map((m) => [m.id, m]));
+
+    const leaf = threadLeafId ? byId.get(threadLeafId) : byId.get(threadRootId);
+    const chain: UIMessage[] = [];
+    let cur = leaf;
+    while (cur) {
+      chain.push(cur);
+      cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
+    }
+    return chain.reverse();
+  }, [state.messages, threadRootId, threadLeafId]);
+
+  // Clamp scrollOffset whenever message view changes (thread/session changes can shrink list)
+  useEffect(() => {
+    setScrollOffset((o) => Math.min(Math.max(o, 0), Math.max(0, viewMessages.length - 1)));
+  }, [viewMessages.length]);
+
   const hint = useMemo(() => {
     return 'Shortcuts: Press "Esc" to close overlays, Ctrl+C to exit.';
   }, []);
@@ -162,8 +182,10 @@ export function ChatApp(props: ChatAppProps) {
   useInput(async (ch, key) => {
     if (key.ctrl && ch === 'c') exit();
 
-    // global palette
-    if (!paletteOpen && !searchOpen && !exportOpen && !settingsOpen && ch === '/') setPaletteOpen(true);
+    // global palette (only when input is empty to avoid hijacking normal typing like paths)
+    if (!paletteOpen && !searchOpen && !exportOpen && !settingsOpen && ch === '/' && input.trim().length === 0) {
+      setPaletteOpen(true);
+    }
 
     // panels
     if (key.ctrl && ch === 'f') setSearchOpen(true);
@@ -225,7 +247,7 @@ export function ChatApp(props: ChatAppProps) {
     if (!anyModal) {
       if (key.upArrow) {
         setAnchorMessageId(null);
-        setScrollOffset((o) => Math.min(o + 1, 5000));
+        setScrollOffset((o) => Math.min(o + 1, Math.max(0, viewMessages.length - 1)));
       }
       if (key.downArrow) {
         setAnchorMessageId(null);
@@ -233,7 +255,7 @@ export function ChatApp(props: ChatAppProps) {
       }
       if (key.pageUp) {
         setAnchorMessageId(null);
-        setScrollOffset((o) => Math.min(o + 20, 5000));
+        setScrollOffset((o) => Math.min(o + 20, Math.max(0, viewMessages.length - 1)));
       }
       if (key.pageDown) {
         setAnchorMessageId(null);
@@ -242,7 +264,7 @@ export function ChatApp(props: ChatAppProps) {
       // top/bottom
       if (key.ctrl && ch === 'a') {
         setAnchorMessageId(null);
-        setScrollOffset(5000);
+        setScrollOffset(Math.max(0, viewMessages.length - 1));
       }
       if (key.ctrl && ch === 'e') {
         setAnchorMessageId(null);
@@ -308,26 +330,8 @@ export function ChatApp(props: ChatAppProps) {
         </Box>
       ) : null}
 
-      <Box flexDirection="column" display={anyModal ? 'none' : 'flex'}>
+      <Box flexDirection="column" display={anyModal ? 'none' : 'flex'} flexGrow={1} justifyContent="flex-end">
         {(() => {
-          const allMessages = state.messages;
-
-          // thread view: show only messages in the path ending at threadRootId
-          const viewMessages = (() => {
-            if (!threadRootId) return allMessages;
-            const byId = new Map(allMessages.map((m) => [m.id, m]));
-
-            // If a leaf is selected, show parent chain up to leaf.
-            const leaf = threadLeafId ? byId.get(threadLeafId) : byId.get(threadRootId);
-            const chain: any[] = [];
-            let cur = leaf;
-            while (cur) {
-              chain.push(cur);
-              cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
-            }
-            return chain.reverse();
-          })();
-
           if (anchorMessageId) {
             const idx = viewMessages.findIndex((m) => m.id === anchorMessageId);
             if (idx >= 0) {
@@ -390,7 +394,21 @@ export function ChatApp(props: ChatAppProps) {
             slice.unshift(m);
             startIdx--;
           }
-          const start = startIdx + 1;
+
+          // If we hit the top and haven't filled the screen, pull in newer messages
+          if (startIdx < 0 && currentHeight < usableHeight) {
+            let nextEnd = viewEnd;
+            while (nextEnd < viewMessages.length) {
+              const m = viewMessages[nextEnd];
+              const msgH = getMessageHeight(m, columns, settings.compactMode);
+              if (currentHeight + msgH > usableHeight) break;
+              currentHeight += msgH;
+              slice.push(m);
+              nextEnd++;
+            }
+          }
+
+          const start = Math.max(0, startIdx + 1);
 
           return (
             <>

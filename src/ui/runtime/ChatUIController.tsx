@@ -7,7 +7,7 @@ import type { Toast } from '../Toasts.js';
 import type { SessionListItem } from '../panels/SessionsPanel.js';
 import type { GlobalSearchHit } from '../panels/SearchAllPanel.js';
 
-import ChatCommand from '../../commands/chat.js';
+import { ChatEngine } from '../../chat/chat-engine.js';
 import { ConfigService } from '../../services/config.service.js';
 
 /**
@@ -19,7 +19,7 @@ import { ConfigService } from '../../services/config.service.js';
  * This is intentionally pragmatic: we keep a single source of truth for agent orchestration.
  */
 export function ChatUIController() {
-  const engineRef = useRef<ChatCommand | null>(null);
+  const engineRef = useRef<ChatEngine | null>(null);
 
   // UI state mirrors engine runtime state
   const [messages, setMessages] = useState<UIMessage[]>([]);
@@ -49,9 +49,9 @@ export function ChatUIController() {
   const tokenLimit = 128_000;
 
   const refreshSessions = useCallback(async () => {
-    const cmd = engineRef.current;
-    if (!cmd) return;
-    const list = (cmd as any).conv.listSessions();
+    const engine = engineRef.current;
+    if (!engine) return;
+    const list = engine.conv.listSessions();
     setSessions(list.map((s: any) => ({
       id: s.id,
       name: s.name,
@@ -63,14 +63,10 @@ export function ChatUIController() {
   const ensureEngine = useCallback(async () => {
     if (engineRef.current) return engineRef.current;
 
-    // Instantiate Chat command engine.
-    // NOTE: oclif normally constructs commands. Here we create a minimal instance.
-    const cmd = new (ChatCommand as any)([], {});
-    engineRef.current = cmd;
+    const engine = new ChatEngine();
+    engineRef.current = engine;
 
-    // Run initialization but do not start its legacy prompt loop.
-    // We call a new helper on the command (added in this branch) that initializes services.
-    await (cmd as any)._initForInkUI({
+    await engine.initForInkUI({
       onState: (s: any) => {
         setTokens(s.tokens);
         setCost(s.cost);
@@ -98,7 +94,11 @@ export function ChatUIController() {
 
     // apply persisted theme/provider (if any)
     try {
-      const s = (cmd as any).conv.getCurrentSession();
+      const s = engine.conv.getCurrentSession();
+      if (!s) {
+        await refreshSessions();
+        return engine;
+      }
       // persist provider per session
       let cfgProvider = 'unknown';
       try {
@@ -108,7 +108,7 @@ export function ChatUIController() {
       s.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: cfgProvider };
       if (!s.settings.provider || s.settings.provider === 'unknown') s.settings.provider = cfgProvider;
       setProvider(s.settings.provider ?? 'unknown');
-      (cmd as any).conv.saveSession();
+      engine.conv.saveSession();
       const t = s?.settings?.theme;
       if (t === 'dark' || t === 'light' || t === 'high-contrast') setThemeName(t);
       const tr = (s?.settings as any)?.threadRootId;
@@ -128,7 +128,7 @@ export function ChatUIController() {
         if (!ok) {
           setSavedThreadLeafId(null);
           (s.settings as any).threadLeafId = null;
-          (cmd as any).conv.saveSession();
+          engine.conv.saveSession();
         }
       }
       const rc = (s?.settings as any)?.recentCommands;
@@ -141,7 +141,7 @@ export function ChatUIController() {
 
     await refreshSessions();
 
-    return cmd;
+    return engine;
   }, []);
 
   useEffect(() => {
@@ -159,14 +159,14 @@ export function ChatUIController() {
   }, []);
 
   const incUsage = useCallback(async (key: string) => {
-    const cmd = await ensureEngine();
-    const session = (cmd as any).conv.getCurrentSession();
+    const engine = await ensureEngine();
+    const session = engine.getCurrentSession();
     if (!session) return;
     session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {} };
     (session.settings as any).usage ??= {};
     (session.settings as any).usage[key] = ((session.settings as any).usage[key] ?? 0) + 1;
     setUsage({ ...(session.settings as any).usage });
-    (cmd as any).conv.saveSession();
+    engine.saveSession();
   }, [ensureEngine]);
 
   const archiveIfTooLarge = useCallback(async (cmd: any) => {
@@ -229,13 +229,13 @@ export function ChatUIController() {
   }, [pushToast]);
 
   const onSubmit = useCallback(async (text: string) => {
-    const cmd = await ensureEngine();
-    await archiveIfTooLarge(cmd);
+    const engine = await ensureEngine();
+    await archiveIfTooLarge(engine as any);
 
     // UI-level commands handled here
     if (text.startsWith('/load-session ')) {
       const id = text.replace('/load-session', '').trim();
-      const loaded = (cmd as any).conv.loadSession(id);
+      const loaded = engine.loadSession(id);
       if (loaded) {
         // Reset UI state to loaded session
         setMessages((loaded.messages ?? []).map((m: any) => ({
@@ -275,7 +275,7 @@ export function ChatUIController() {
           if (!ok) {
             setSavedThreadLeafId(null);
             (loaded.settings as any).threadLeafId = null;
-            (cmd as any).conv.saveSession();
+            engine.saveSession();
           }
         }
         const rc = (loaded.settings as any)?.recentCommands;
@@ -294,7 +294,7 @@ export function ChatUIController() {
 
     if (text.startsWith('/delete-session ')) {
       const id = text.replace('/delete-session', '').trim();
-      const ok = (cmd as any).conv.deleteSession(id);
+      const ok = engine.deleteSession(id);
       pushToast(ok ? 'success' : 'error', ok ? 'Session deleted' : 'Delete failed');
       await refreshSessions();
       return;
@@ -309,12 +309,12 @@ export function ChatUIController() {
       let tag = raw;
       try { tag = JSON.parse(raw); } catch { }
 
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       const msg = session?.messages.find((m: any) => m.id === messageId);
       if (!session || !msg) { pushToast('error', 'Message not found'); return; }
       msg.tags ??= [];
       if (!msg.tags.includes(tag)) msg.tags.push(tag);
-      (cmd as any).conv.saveSession();
+      engine.saveSession();
       setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, tags: msg.tags } : m)));
       pushToast('success', `Tagged: ${tag}`);
       return;
@@ -329,11 +329,11 @@ export function ChatUIController() {
       let tag = raw;
       try { tag = JSON.parse(raw); } catch { }
 
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       const msg = session?.messages.find((m: any) => m.id === messageId);
       if (!session || !msg) { pushToast('error', 'Message not found'); return; }
       msg.tags = (msg.tags ?? []).filter((t: string) => t !== tag);
-      (cmd as any).conv.saveSession();
+      engine.saveSession();
       setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, tags: msg.tags } : m)));
       pushToast('success', `Removed tag: ${tag}`);
       return;
@@ -342,7 +342,7 @@ export function ChatUIController() {
     if (text.startsWith('/prune-branch ')) {
       await incUsage('prune-branch');
       const leafId = text.replace('/prune-branch', '').trim();
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (!session) return;
 
       const byId = new Map<string, any>(session.messages.map((m: any) => [m.id, m]));
@@ -366,7 +366,7 @@ export function ChatUIController() {
         setSavedThreadRootId(null);
         setSavedThreadLeafId(null);
       }
-      (cmd as any).conv.saveSession();
+      engine.saveSession();
       setMessages((prev) => prev.filter((m) => !toDelete.has(m.id)));
 
       pushToast('success', `Pruned ${before - session.messages.length} message(s)`);
@@ -376,7 +376,7 @@ export function ChatUIController() {
     if (text.startsWith('/delete-msg ')) {
       await incUsage('delete-msg');
       const messageId = text.replace('/delete-msg', '').trim();
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (!session) return;
       const before = session.messages.length;
       session.messages = session.messages.filter((m: any) => m.id !== messageId);
@@ -386,7 +386,7 @@ export function ChatUIController() {
         (session.settings as any).threadRootId = null;
         (session.settings as any).threadLeafId = null;
       }
-      (cmd as any).conv.saveSession();
+      engine.saveSession();
       setMessages((prev) => prev.filter((m) => m.id !== messageId));
       if (savedThreadLeafId === messageId) setSavedThreadLeafId(null);
       if (savedThreadRootId === messageId) {
@@ -406,13 +406,13 @@ export function ChatUIController() {
       let newContent = raw;
       try { newContent = JSON.parse(raw); } catch { }
 
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       const msg = session?.messages.find((m: any) => m.id === messageId);
       if (!session || !msg) { pushToast('error', 'Message not found'); return; }
       if (msg.role !== 'assistant') { pushToast('warn', 'Not an assistant message'); return; }
       msg.content = newContent;
       msg.editedAt = new Date().toISOString();
-      (cmd as any).conv.saveSession();
+      engine.saveSession();
       setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: String(newContent), editedAt: msg.editedAt } : m)));
       pushToast('success', 'Assistant message edited');
       return;
@@ -428,7 +428,7 @@ export function ChatUIController() {
       let newContent = raw;
       try { newContent = JSON.parse(raw); } catch { }
 
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (!session) return;
 
       const msg = session.messages.find((m: any) => m.id === messageId);
@@ -439,7 +439,7 @@ export function ChatUIController() {
 
       msg.content = newContent;
       msg.editedAt = new Date().toISOString();
-      (cmd as any).conv.saveSession();
+      engine.saveSession();
 
       // Update UI message content
       setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: String(newContent), editedAt: msg.editedAt } : m)));
@@ -450,7 +450,7 @@ export function ChatUIController() {
       // Re-run using edited message content as next prompt if it's a user message
       if (msg.role === 'user' && typeof newContent === 'string') {
         pushToast('info', 'Re-running edited message as new branch…');
-        await (cmd as any)._handleInkLine(newContent);
+        await engine.handleInkLine(newContent);
         await refreshSessions();
         pushToast('success', 'Branched re-run complete');
       } else {
@@ -466,24 +466,18 @@ export function ChatUIController() {
       let newPrompt = raw;
       try { newPrompt = JSON.parse(raw); } catch { }
 
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (session) {
         const idx = [...session.messages].reverse().findIndex((m: any) => m.role === 'user');
         if (idx >= 0) {
           const realIdx = session.messages.length - 1 - idx;
           session.messages[realIdx].content = newPrompt;
           session.messages[realIdx].editedAt = new Date().toISOString();
-          (cmd as any).conv.saveSession();
+          engine.saveSession();
 
           // Also update engine msgs list (best-effort): replace last user in cmd.msgs
-          const mIdx = [...(cmd as any).msgs].reverse().findIndex((m: any) => m.role === 'user');
-          if (mIdx >= 0) {
-            const ridx = (cmd as any).msgs.length - 1 - mIdx;
-            (cmd as any).msgs[ridx].content = newPrompt;
-          }
-
           // rerun
-          await (cmd as any)._handleInkLine(newPrompt);
+          await engine.handleInkLine(newPrompt);
           pushToast('success', 'Re-ran edited prompt');
         }
       }
@@ -548,7 +542,7 @@ export function ChatUIController() {
       const rest = text.replace('/export-ui', '').trim().split(' ');
       const format = rest[0] as 'md' | 'json' | undefined;
       const outPath = rest.slice(1).join(' ').trim();
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (!format || !outPath || !session) {
         pushToast('error', 'Export usage: /export-ui <md|json> <path>');
         return;
@@ -595,12 +589,12 @@ export function ChatUIController() {
         }
 
         // Save into sessions directory (same path as ConversationService uses)
-        const sessionsDir = (cmd as any).conv.constructor.SESSIONS_DIR;
+        const sessionsDir = (engine.conv.constructor as any).SESSIONS_DIR;
         const outPath = join(sessionsDir, `${session.id}.json`);
         writeFileSync(outPath, JSON.stringify(session, null, 2), 'utf-8');
 
         // Load it
-        const loaded = (cmd as any).conv.loadSession(session.id);
+        const loaded = engine.loadSession(session.id);
         if (loaded) {
           setMessages((loaded.messages ?? []).map((m: any) => ({
             id: m.id,
@@ -631,10 +625,9 @@ export function ChatUIController() {
 
     if (text.startsWith('/revert-all')) {
       await incUsage('revert-all');
-      const tools = (cmd as any).lastTools;
-      if (tools && tools.snapshots && tools.snapshots.length > 0) {
-        tools.undoAll();
-        pushToast('success', 'Reverted all changes');
+      const restored = engine.revertAll();
+      if (restored.length > 0) {
+        pushToast('success', `Reverted ${restored.length} file(s)`);
       } else {
         pushToast('warn', 'Nothing to revert');
       }
@@ -645,24 +638,8 @@ export function ChatUIController() {
     if (text.startsWith('/revert-file ')) {
       await incUsage('revert-file');
       const rel = text.replace('/revert-file', '').trim();
-      const tools = (cmd as any).lastTools;
-      const snaps = tools?.snapshots ?? [];
-      const snap = snaps.find((s: any) => s.relPath.replace(/\\/g, '/') === rel.replace(/\\/g, '/'));
-      if (!snap) {
-        pushToast('warn', `No snapshot for ${rel}`);
-        return;
-      }
-      try {
-        const { writeFileSync, existsSync, unlinkSync } = await import('fs');
-        if (snap.existed && snap.content !== null) {
-          writeFileSync(snap.absPath, snap.content, 'utf-8');
-        } else if (!snap.existed && existsSync(snap.absPath)) {
-          unlinkSync(snap.absPath);
-        }
-        pushToast('success', `Reverted ${rel}`);
-      } catch (e: any) {
-        pushToast('error', e?.message ?? 'Revert failed');
-      }
+      const ok = await engine.revertFile(rel);
+      pushToast(ok ? 'success' : 'warn', ok ? `Reverted ${rel}` : `No snapshot for ${rel}`);
       return;
     }
 
@@ -670,14 +647,14 @@ export function ChatUIController() {
       await incUsage('palette-select');
       const raw = text.replace('/recent-cmd', '').trim();
       const cmdText = raw;
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (session) {
         session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null };
         session.settings.recentCommands ??= [];
         if (cmdText) {
           session.settings.recentCommands = [cmdText, ...session.settings.recentCommands.filter((x: string) => x !== cmdText)].slice(0, 20);
           setRecentCommands(session.settings.recentCommands);
-          (cmd as any).conv.saveSession();
+          engine.saveSession();
         }
       }
       return;
@@ -685,11 +662,11 @@ export function ChatUIController() {
 
     if (text.startsWith('/thread-leaf')) {
       const raw = text.replace('/thread-leaf', '').trim();
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (session) {
         session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
         (session.settings as any).threadLeafId = raw || null;
-        (cmd as any).conv.saveSession();
+        engine.saveSession();
         setSavedThreadLeafId(raw || null);
         pushToast('success', raw ? 'Branch leaf selected' : 'Leaf cleared');
       }
@@ -698,14 +675,14 @@ export function ChatUIController() {
 
     if (text.startsWith('/thread-root')) {
       const raw = text.replace('/thread-root', '').trim();
-      const session = (cmd as any).conv.getCurrentSession();
+      const session = engine.getCurrentSession();
       if (session) {
         session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
         (session.settings as any).threadRootId = raw || null;
         (session.settings as any).threadLeafId = null;
         setSavedThreadRootId(raw || null);
         setSavedThreadLeafId(null);
-        (cmd as any).conv.saveSession();
+        engine.saveSession();
         pushToast('success', raw ? 'Thread selected' : 'Thread cleared');
       }
       return;
@@ -726,7 +703,7 @@ export function ChatUIController() {
       try { q = JSON.parse(raw); } catch { }
 
       const query = String(q).trim().toLowerCase();
-      const list = (cmd as any).conv.listSessions();
+      const list = engine.conv.listSessions();
       const hits: GlobalSearchHit[] = [];
       for (const s of list) {
         for (const m of s.messages ?? []) {
@@ -755,13 +732,13 @@ export function ChatUIController() {
       // If we're in a branch, attach parentMessageId to the next user message at persistence level.
       if (branchParentId && !text.startsWith('/')) {
         // Add user message with parentMessageId to session + engine
-        (cmd as any).msgs.push({ role: 'user', content: text });
-        (cmd as any).conv.addMessage('user', text, { parentMessageId: branchParentId });
+        // Persist branch relationship; engine will read from persisted session
+        engine.conv.addMessage('user', text, { parentMessageId: branchParentId });
         // Clear branch parent once used
         setBranchParentId(null);
-        await (cmd as any)._handleInkLine(text);
+        await engine.handleInkLine(text);
       } else {
-        await (cmd as any)._handleInkLine(text);
+        await engine.handleInkLine(text);
       }
     } catch (e: any) {
       pushToast('error', e?.message ?? 'Command failed');
@@ -772,8 +749,8 @@ export function ChatUIController() {
   }, [ensureEngine, refreshSessions]);
 
   const onRegenerateLast = useCallback(async () => {
-    const cmd = await ensureEngine();
-    const session = (cmd as any).conv.getCurrentSession();
+    const engine = await ensureEngine();
+    const session = engine.getCurrentSession();
     if (!session) return;
 
     // Find last assistant message and last user message
@@ -784,7 +761,7 @@ export function ChatUIController() {
     // Remove the last assistant message from persisted session
     const realAIdx = session.messages.length - 1 - lastAssistantIdx;
     session.messages.splice(realAIdx, 1);
-    (cmd as any).conv.saveSession();
+    engine.saveSession();
 
     // Also remove last assistant from UI messages
     setMessages((prev) => {
@@ -802,7 +779,7 @@ export function ChatUIController() {
     if (typeof lastUser.content === 'string') {
       try {
         setIsGenerating(true);
-        await (cmd as any)._handleInkLine(lastUser.content);
+        await engine.handleInkLine(lastUser.content);
         await refreshSessions();
         pushToast('success', 'Regenerated');
       } finally {
@@ -812,13 +789,13 @@ export function ChatUIController() {
   }, [ensureEngine, pushToast, refreshSessions]);
 
   const onTogglePinLast = useCallback(async () => {
-    const cmd = await ensureEngine();
-    await (cmd as any)._inkTogglePinLast();
+    const engine = await ensureEngine();
+    await engine.togglePinLast();
   }, [ensureEngine]);
 
   const onReactLast = useCallback(async (reaction: 'up' | 'down') => {
-    const cmd = await ensureEngine();
-    await (cmd as any)._inkReactLast(reaction);
+    const engine = await ensureEngine();
+    await engine.reactLast(reaction);
   }, [ensureEngine]);
 
   const getRuntimeState = useCallback(() => ({

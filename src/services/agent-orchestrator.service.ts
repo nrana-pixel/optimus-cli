@@ -17,8 +17,7 @@
  *     → 8. Return AgentResult
  */
 
-import { writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { resolve, relative, isAbsolute, normalize } from 'path';
 
 import { LLMServiceLiteLLM }              from './llm-litellm.service.js';
 import { AnalyzerService }                from './analyzer.service.js';
@@ -290,7 +289,7 @@ export class AgentOrchestrator {
     }
 
     // Parse code blocks from the final response
-    step.files = this.parseAndWriteBlocks(step.response, resolve(opt.outputDir), emit);
+    step.files = await this.parseAndWriteBlocks(step.response, resolve(opt.outputDir), emit);
 
     return step;
   }
@@ -335,27 +334,53 @@ export class AgentOrchestrator {
 
   // ─── Code block parser + file writer ────────────────────────────────────
 
-  private parseAndWriteBlocks(
+  private async parseAndWriteBlocks(
     response:  string,
     outputDir: string,
     emit:      (ev: AgentEvent) => void,
-  ): string[] {
+  ): Promise<string[]> {
 
     const written: string[] = [];
     const BLOCK_RE = /```(?:[\w-]+)?:([^\n]+)\n([\s\S]*?)```/g;
     let m: RegExpExecArray | null;
+
+    const isSafeRelPath = (p: string): boolean => {
+      if (!p) return false;
+      const norm = normalize(p).replace(/\\/g, '/');
+      if (isAbsolute(norm)) return false;
+      if (/^[A-Za-z]:\//.test(norm)) return false;
+      if (norm === '..' || norm.startsWith('../') || norm.includes('/../')) return false;
+      return true;
+    };
 
     while ((m = BLOCK_RE.exec(response)) !== null) {
       const filename = m[1].trim();
       const content  = m[2];
       if (!filename || !content.trim()) continue;
 
-      const fp = join(outputDir, filename);
-      const fd = dirname(fp);
+      if (!isSafeRelPath(filename)) {
+        emit({ type: 'error', message: `Blocked unsafe write path: ${filename}` });
+        continue;
+      }
 
-      if (!existsSync(fd)) mkdirSync(fd, { recursive: true });
-      writeFileSync(fp, content, 'utf-8');
-      written.push(fp);
+      const fp = resolve(outputDir, filename);
+      const relToOut = relative(outputDir, fp).replace(/\\/g, '/');
+      if (relToOut.startsWith('..')) {
+        emit({ type: 'error', message: `Blocked write outside outputDir: ${filename}` });
+        continue;
+      }
+
+      const toolResult = await this.tools.execute({
+        name: 'write_file',
+        args: { path: relToOut, content },
+      });
+
+      if (toolResult.error) {
+        emit({ type: 'error', message: `Failed to write ${filename}: ${toolResult.error}` });
+        continue;
+      }
+
+      written.push(relToOut);
       emit({ type: 'file_written', message: `✅ ${filename}`, data: { path: fp } });
     }
 

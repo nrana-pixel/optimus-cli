@@ -22,7 +22,9 @@ export interface WorkspaceConfig {
 export class ConfigService {
   private static readonly CONFIG_DIR = join(homedir(), '.multi-agent');
   private static readonly CONFIG_FILE = join(this.CONFIG_DIR, 'config.json');
-  private static readonly ALGORITHM = 'aes-256-cbc';
+  // Prefer authenticated encryption.
+  private static readonly ALGORITHM_GCM = 'aes-256-gcm';
+  private static readonly ALGORITHM_LEGACY = 'aes-256-cbc';
   private static readonly SALT = 'multi-agent-cli'; // In production, use a secure salt
 
   /**
@@ -47,30 +49,48 @@ export class ConfigService {
   }
 
   /**
-   * Encrypt API key using AES-256-CBC
+   * Encrypt API key using AES-256-GCM (authenticated encryption).
+   * Format: gcm:<ivHex>:<tagHex>:<cipherHex>
    */
   static encryptApiKey(apiKey: string): string {
     try {
-      const iv = randomBytes(16);
+      const iv = randomBytes(12); // recommended length for GCM
       const key = scryptSync(this.SALT, 'salt', 32);
-      const cipher = createCipheriv(this.ALGORITHM, key, iv);
+      const cipher = createCipheriv(this.ALGORITHM_GCM, key, iv);
 
       let encrypted = cipher.update(apiKey, 'utf8', 'hex');
       encrypted += cipher.final('hex');
+      const tag = cipher.getAuthTag();
 
-      // Combine IV and encrypted data
-      return iv.toString('hex') + ':' + encrypted;
+      return `gcm:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted}`;
     } catch (error) {
       throw new Error(`Failed to encrypt API key: ${error}`);
     }
   }
 
   /**
-   * Decrypt API key
+   * Decrypt API key.
+   * Supports both new AES-256-GCM format and legacy AES-256-CBC format.
    */
   static decryptApiKey(encryptedKey: string): string {
     try {
       const parts = encryptedKey.split(':');
+
+      // New format: gcm:<ivHex>:<tagHex>:<cipherHex>
+      if (parts[0] === 'gcm') {
+        if (parts.length !== 4) throw new Error('Invalid GCM encrypted key format');
+        const iv = Buffer.from(parts[1], 'hex');
+        const tag = Buffer.from(parts[2], 'hex');
+        const encrypted = parts[3];
+        const key = scryptSync(this.SALT, 'salt', 32);
+        const decipher = createDecipheriv(this.ALGORITHM_GCM, key, iv);
+        decipher.setAuthTag(tag);
+        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return decrypted;
+      }
+
+      // Legacy format: <ivHex>:<cipherHex>
       if (parts.length !== 2) {
         throw new Error('Invalid encrypted key format');
       }
@@ -78,7 +98,7 @@ export class ConfigService {
       const iv = Buffer.from(parts[0], 'hex');
       const encrypted = parts[1];
       const key = scryptSync(this.SALT, 'salt', 32);
-      const decipher = createDecipheriv(this.ALGORITHM, key, iv);
+      const decipher = createDecipheriv(this.ALGORITHM_LEGACY, key, iv);
 
       let decrypted = decipher.update(encrypted, 'hex', 'utf8');
       decrypted += decipher.final('utf8');

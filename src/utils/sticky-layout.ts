@@ -15,6 +15,11 @@ export class StickyLayout {
   private lastHeader = '';
 
   enable() {
+    // Only enable in interactive terminals.
+    if (!process.stdout.isTTY) {
+      this.enabled = false;
+      return;
+    }
     this.enabled = true;
   }
 

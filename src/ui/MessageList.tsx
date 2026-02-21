@@ -38,7 +38,7 @@ export function MessageList(props: {
               <Text dimColor>{reactions}</Text>
               {m.editedAt ? <Text dimColor>{'  (edited)'}</Text> : null}
             </Text>
-            <Text>{m.content}</Text>
+            <Text>{typeof m.content === 'string' ? m.content : String((m as any).content)}</Text>
           </Box>
         );
       })}

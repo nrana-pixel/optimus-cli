@@ -26,6 +26,15 @@ function ask(question: string, hidden = false): Promise<string> {
 
     if (hidden) {
       // Write question manually without echo for password-style input
+      if (!process.stdin.isTTY || typeof (process.stdin as any).setRawMode !== 'function') {
+        // Fallback: no raw mode available (CI / piped input). Do a normal prompt.
+        rl.question(question, (answer) => {
+          rl.close();
+          resolve(answer.trim());
+        });
+        return;
+      }
+
       process.stdout.write(question);
       process.stdin.setRawMode(true);
       let answer = '';
@@ -80,25 +89,44 @@ function askSelect(question: string, choices: { title: string; value: string }[]
     };
 
     draw();
+
+    if (!process.stdin.isTTY || typeof (process.stdin as any).setRawMode !== 'function') {
+      // Non-interactive fallback: return the first option.
+      resolve(choices[0]?.value ?? '');
+      return;
+    }
+
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
+
+    const cleanup = () => {
+      try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+      process.stdin.removeListener('data', onKey);
+    };
 
     const onKey = (k: string) => {
       if (k === '\x1b[A' && sel > 0) { sel--; draw(); }
       else if (k === '\x1b[B' && sel < choices.length - 1) { sel++; draw(); }
       else if (k === '\r' || k === '\n') {
-        process.stdin.setRawMode(false);
-        process.stdin.removeListener('data', onKey);
+        cleanup();
         // Clear the menu rows
         for (let i = 0; i < choices.length + 1; i++) o('\n\x1b[2K\x1b[1A');
         o('\n');
         o(`  ${p(A.gy, '→')} ${p(A.cy + A.b, choices[sel].title)}\n`);
         resolve(choices[sel].value);
-      } else if (k === '\u0003') { process.stdin.setRawMode(false); process.exit(0); }
+      } else if (k === '\u0003') {
+        cleanup();
+        process.exit(0);
+      }
     };
 
-    process.stdin.on('data', onKey);
+    try {
+      process.stdin.on('data', onKey);
+    } catch {
+      cleanup();
+      resolve(choices[sel]?.value ?? '');
+    }
   });
 }
 
@@ -173,7 +201,7 @@ export default class Config extends Command {
     o('\n');
     if (!ConfigService.isInitialized()) {
       o(p(A.re, '  ✘  Not initialized.\n'));
-      o(p(A.gy, '  Run: ') + p(A.cy, 'ai init\n\n'));
+      o(p(A.gy, '  Run: ') + p(A.cy, 'optimus init\n\n'));
       return;
     }
     this._printCurrentConfig();
@@ -203,7 +231,7 @@ export default class Config extends Command {
 
   private async _setKey() {
     if (!ConfigService.isInitialized()) {
-      o(p(A.re, '\n  ✘  Run ai init first.\n\n'));
+      o(p(A.re, '\n  ✘  Run optimus init first.\n\n'));
       return;
     }
     const cfg = ConfigService.loadConfig();
@@ -257,7 +285,7 @@ export default class Config extends Command {
     o('\n');
     o(p(A.gr, `  ✔  Provider set to: `) + p(A.cy + A.b, provider.toUpperCase()) + '\n');
     o(p(A.gy, '  Your existing API key is still stored — update it with:\n'));
-    o(p(A.gy, '  ') + p(A.cy, 'ai config set-key\n\n'));
+    o(p(A.gy, '  ') + p(A.cy, 'optimus config set-key\n\n'));
   }
 
   // ─── set-model ────────────────────────────────────────────────────────────
@@ -346,6 +374,6 @@ export default class Config extends Command {
     }
     ConfigService.deleteConfig();
     o(p(A.gr, '\n  ✔  Config wiped.\n'));
-    o(p(A.gy, '  Run ') + p(A.cy, 'ai init') + p(A.gy, ' to set up again.\n\n'));
+    o(p(A.gy, '  Run ') + p(A.cy, 'optimus init') + p(A.gy, ' to set up again.\n\n'));
   }
 }

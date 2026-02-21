@@ -284,7 +284,8 @@ export class ToolsService {
     // ── Snapshot for /undo ──
     this._snapshot(abs, rel);
 
-    const updated = original.replace(oldContent, newContent);
+    // Replace all occurrences (predictable behavior for users)
+    const updated = original.split(oldContent).join(newContent);
     writeFileSync(abs, updated, 'utf-8');
 
     const lines = updated.split('\n').length;
@@ -292,10 +293,7 @@ export class ToolsService {
 
     const oldLines = oldContent.split('\n').length;
     const newLines = newContent.split('\n').length;
-    let msg = `Edited: ${filePath} — replaced ${oldLines} line(s) with ${newLines} line(s)`;
-    if (count > 1) {
-      msg += ` (WARNING: ${count} occurrences found, only the first was replaced. Use write_file for full control.)`;
-    }
+    const msg = `Edited: ${filePath} — replaced ${count} occurrence(s) (${oldLines} line(s) → ${newLines} line(s))`;
     return msg;
   }
 
@@ -337,7 +335,12 @@ export class ToolsService {
     if (!pattern) return 'search_files requires a pattern argument';
 
     const results: string[] = [];
-    const re = new RegExp(pattern, 'gi');
+    let re: RegExp;
+    try {
+      re = new RegExp(pattern, 'gi');
+    } catch (e: any) {
+      return `Invalid search pattern (regex): ${e?.message ?? String(e)}`;
+    }
     const IGNORE = new Set(['node_modules', '.git', 'dist', 'build', '.next']);
     const EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.cs', '.md', '.json', '.yaml', '.yml', '.css', '.html', '.sql', '.sh']);
 
@@ -422,12 +425,35 @@ export class ToolsService {
 
   private runCommand(cmd: string): string {
     if (!cmd) return 'run_command requires a command argument';
-    if (!isSafeCommand(cmd)) {
-      return `Blocked: "${cmd}" matches a potentially destructive pattern. Only safe read-only commands are allowed.`;
+
+    const trimmed = cmd.trim();
+
+    // Strict allowlist: run_command is intended for safe read-only inspection.
+    const allowed = [
+      /^git\s+status(\s+--short)?$/i,
+      /^git\s+diff(\s+.+)?$/i,
+      /^git\s+log(\s+.+)?$/i,
+      /^(ls|dir)(\s+.*)?$/i,
+      /^pwd$/i,
+      /^whoami$/i,
+      /^node\s+--version$/i,
+      /^npm\s+--version$/i,
+      /^pnpm\s+--version$/i,
+      /^yarn\s+--version$/i,
+      /^tsc\s+--version$/i,
+    ];
+
+    const isAllowed = allowed.some((re) => re.test(trimmed));
+    if (!isAllowed) {
+      // Keep legacy pattern blocker as defense-in-depth.
+      if (!isSafeCommand(trimmed)) {
+        return `Blocked: "${cmd}" matches a potentially destructive pattern. Only safe read-only commands are allowed.`;
+      }
+      return `Blocked: "${cmd}" is not in the allowlist for run_command. Use git_status/git_diff/git_log or run a safe allowlisted command.`;
     }
 
     try {
-      const output = execSync(cmd, {
+      const output = execSync(trimmed, {
         cwd:     this.workingDir,
         timeout: 10_000,
         encoding: 'utf-8',
@@ -609,7 +635,7 @@ Do NOT ask for permission to write files — just do it.
 
 ## edit_file — how to use:
 
-edit_file replaces the FIRST occurrence of old_content with new_content.
+edit_file replaces ALL occurrences of old_content with new_content.
 old_content must EXACTLY match part of the file (including whitespace/indentation).
 
 Example:

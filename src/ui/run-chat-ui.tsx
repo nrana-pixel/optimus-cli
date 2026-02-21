@@ -6,9 +6,11 @@ export async function runChatUI() {
   // Write ANSI exact clear + alt screen to prevent rendering ghost lines
   process.stdout.write('\x1b[?1049h');
 
-  const app = render(<ChatUIController />);
-  await app.waitUntilExit();
-
-  // Restore main screen buffer
-  process.stdout.write('\x1b[?1049l');
+  try {
+    const app = render(<ChatUIController />);
+    await app.waitUntilExit();
+  } finally {
+    // Restore main screen buffer even on crashes
+    process.stdout.write('\x1b[?1049l');
+  }
 }

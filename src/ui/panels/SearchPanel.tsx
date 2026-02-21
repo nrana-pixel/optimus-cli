@@ -15,8 +15,12 @@ export function SearchPanel(props: {
 
   useInput((ch, key) => {
     if (key.escape) props.onClose();
-    if (key.ctrl && (ch === 'n' || ch === 'N')) setSelectedIndex((i) => i + 1);
-    if (key.ctrl && (ch === 'p' || ch === 'P')) setSelectedIndex((i) => Math.max(0, i - 1));
+    if (key.ctrl && (ch === 'n' || ch === 'N')) {
+      setSelectedIndex((i) => (results.length ? (i + 1) % results.length : 0));
+    }
+    if (key.ctrl && (ch === 'p' || ch === 'P')) {
+      setSelectedIndex((i) => (results.length ? (i - 1 + results.length) % results.length : 0));
+    }
     if (key.return) {
       // Jump to currently selected item
       const idx = Math.min(Math.max(0, selectedIndex), results.length - 1);
