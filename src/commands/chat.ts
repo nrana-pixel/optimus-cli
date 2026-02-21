@@ -10,6 +10,10 @@ import { IndexService, geminiEmbed, openaiEmbed } from '../services/index.servic
 import type { LocalModel } from '../types/local-model.js';
 import { resolve, extname as pathExtname } from 'path';
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from 'fs';
+import { markdownRenderer } from '../utils/markdown-renderer.js';
+import { stickyLayout } from '../utils/sticky-layout.js';
+import { toolExecutorUI } from '../utils/tool-executor-ui.js';
+import { renderUnifiedDiff } from '../utils/diff-viewer.js';
 
 // ─── ANSI / terminal helpers ─────────────────────────────────────────────────
 
@@ -62,6 +66,7 @@ const CMDS = [
   { cmd: '/save',       args: '',           desc: 'Force-save session to disk'                     },
   { cmd: '/sessions',   args: '',           desc: 'List saved sessions'                            },
   { cmd: '/config',     args: '',           desc: 'Show current API config'                        },
+  { cmd: '/multiline',  args: '',           desc: 'Open editor for multiline input'                 },
   { cmd: '/exit',       args: '',           desc: 'Quit (also Ctrl+C)'                             },
 ];
 
@@ -112,7 +117,7 @@ class Prompt {
   private ddItems: typeof CMDS = [];   // current filtered set
   private ddSel   = 0;                 // currently highlighted row (0-based)
   private ddOpen  = false;             // is dropdown visible?
-  private ddLines = 0;                 // how many lines the dropdown occupies (for cleanup)
+  private cursorVisualRow = 0;         // Tracks vertical cursor offset relative to the start of prompt
 
   // Prefix "  ❯ " = 4 printable chars
   private static readonly PFX = 4;
@@ -148,25 +153,45 @@ class Prompt {
    * Never go above the input line — that caused the ghost copies.
    */
   private _redraw() {
-    // ── 1. Erase old dropdown rows (walk DOWN then back UP) ──────────────────
-    if (this.ddLines > 0) {
-      for (let i = 0; i < this.ddLines; i++) o('\n\r' + A.cl);
-      o(A.up(this.ddLines));
+    const cols = process.stdout.columns || 80;
+
+    // ── 1. Erase old render by moving up to start of prompt and clearing down ──
+    if (this.cursorVisualRow > 0) {
+      o(A.up(this.cursorVisualRow));
     }
+    o('\r' + A.cd);
 
-    // ── 2. Redraw input line ─────────────────────────────────────────────────
-    o('\r' + A.cl);
-    o(p(A.mg + A.b, '  ❯') + ' ' + this.buf);
+    // ── 2. Draw the prompt line by line ──────────────────────────────────────
+    const pfxStr = p(A.mg + A.b, '  ❯') + ' ';
+    const firstLineLen = cols - Prompt.PFX;
+    
+    let remaining = this.buf;
+    const linesToDraw: string[] = [];
+    
+    // First line (shorter due to prefix)
+    linesToDraw.push(remaining.slice(0, Math.max(0, firstLineLen)));
+    remaining = remaining.slice(Math.max(0, firstLineLen));
+    
+    // Subsequent lines
+    while (remaining.length > 0) {
+      linesToDraw.push(remaining.slice(0, cols));
+      remaining = remaining.slice(cols);
+    }
+    
+    for (let i = 0; i < linesToDraw.length; i++) {
+      if (i === 0) o(pfxStr + linesToDraw[i]);
+      else o('\n\r' + linesToDraw[i]);
+    }
+    
+    const promptLines = linesToDraw.length;
 
-    // ── 3. Draw new dropdown below ───────────────────────────────────────────
+    // ── 3. Draw the dropdown ─────────────────────────────────────────────────
+    let newDdLines = 0;
     if (this.ddOpen && this.ddItems.length > 0) {
       const visible  = this.ddItems.slice(0, Prompt.MAX_DD);
-      let   newLines = 0;
-
       for (let i = 0; i < visible.length; i++) {
         const item       = visible[i];
         const isSelected = i === this.ddSel;
-
         const rawMk = isSelected ? '  ▸ ' : '    ';
         const rawCm = item.cmd.padEnd(14);
         const rawDs = item.desc;
@@ -176,39 +201,40 @@ class Prompt {
         const ds = isSelected ? p(A.wh, rawDs)        : p(A.gy + A.d, rawDs);
 
         o('\n\r' + A.cl + mk + cm + ds);
-        newLines++;
+        newDdLines++;
       }
 
       if (this.ddItems.length > Prompt.MAX_DD) {
         o('\n\r' + A.cl + p(A.gy, `    + ${this.ddItems.length - Prompt.MAX_DD} more`));
-        newLines++;
+        newDdLines++;
       }
-
-      // ── 4. Return cursor to input line ─────────────────────────────────────
-      o(A.up(newLines));
-      this.ddLines = newLines;   // store AFTER up-move so next erase knows the count
-    } else {
-      this.ddLines = 0;
     }
 
-    // Position cursor at correct column on input line
-    o(A.col(Prompt.PFX + this.pos + 1));
+    // ── 4. Position cursor at correct row and col ────────────────────────────
+    let targetRow = 0;
+    let targetCol = Prompt.PFX + this.pos;
+    if (targetCol >= cols) {
+      const rem = targetCol - cols;
+      targetRow = 1 + Math.floor(rem / cols);
+      targetCol = rem % cols;
+    }
+    
+    this.cursorVisualRow = targetRow;
+    
+    const currentPhysicalRow = (promptLines - 1) + newDdLines;
+    const upDistance = currentPhysicalRow - targetRow;
+    
+    if (upDistance > 0) o(A.up(upDistance));
+    o('\r');
+    if (targetCol > 0) o(A.col(targetCol + 1)); // VT100 columns are 1-indexed
   }
 
   /** Erase dropdown rows (walk down then back up), reset state. */
   private _closeDropdown() {
-    if (this.ddLines > 0) {
-      for (let i = 0; i < this.ddLines; i++) o('\n\r' + A.cl);
-      o(A.up(this.ddLines));
-    }
     this.ddOpen  = false;
     this.ddItems = [];
     this.ddSel   = 0;
-    this.ddLines = 0;
-    // Re-stamp input line cleanly
-    o('\r' + A.cl);
-    o(p(A.mg + A.b, '  ❯') + ' ' + this.buf);
-    o(A.col(Prompt.PFX + this.pos + 1));
+    this._redraw();
   }
 
   /** Update dropdown filter based on current buf */
@@ -261,9 +287,21 @@ class Prompt {
 
       const line = this.buf.trim();
       this._closeDropdown();
+      
+      // Move to the bottom of the prompt to avoid overwriting it
+      const cols = process.stdout.columns || 80;
+      let targetRow = 0;
+      let targetCol = Prompt.PFX + this.buf.length;
+      if (targetCol >= cols) {
+        targetRow = 1 + Math.floor((targetCol - cols) / cols);
+      }
+      const downRem = targetRow - this.cursorVisualRow;
+      if (downRem > 0) o(A.dn(downRem));
+
       o('\n');
       this.histIdx = -1; this.histBuf = '';
       this.buf = ''; this.pos = 0;
+      this.cursorVisualRow = 0;
       if (!line) { this._redraw(); return; }
       this.hist.push(line);
       process.stdin.pause();
@@ -392,7 +430,7 @@ class Prompt {
 
   private _ctrlL() {
     o('\x1b[2J\x1b[H');
-    this.ddLines = 0;
+    this.cursorVisualRow = 0;
     this._redraw();
   }
 }
@@ -400,9 +438,21 @@ class Prompt {
 // ─── Chat Command ─────────────────────────────────────────────────────────────
 
 export default class Chat extends Command {
+  static id = 'chat';
   static description = 'Optimus Chat — AI Coding Agent';
+
+  // Ink UI integration hooks (optional)
+  private inkHooks: null | {
+    onState: (s: any) => void;
+    onMessage: (m: any) => void;
+    onTools: (t: any[]) => void;
+    onDiffs: (d: any[]) => void;
+    onSnapshots: (toolRunId: string, snapshots: any[]) => void;
+  } = null;
   static flags = {
     model: Flags.string({ char: 'm', description: 'Model to use (overrides config default)' }),
+    // legacy UI removed: Ink TUI is the only supported UI
+    // legacy: Flags.boolean({ description: 'Use legacy non-Ink chat UI', default: false }),
   };
 
   private llm!:  LLMServiceLiteLLM;
@@ -431,58 +481,14 @@ export default class Chat extends Command {
 
   async run() {
     const { flags } = await this.parse(Chat);
-    this.llm = new LLMServiceLiteLLM();
-    if (flags.model) this.llm.setModel(flags.model);
 
-    // ── Auto-init: if no config, run quick inline setup ─────────────────────
-    if (!ConfigService.isInitialized()) {
-      const initOk = await this._autoInit();
-      if (!initOk) {
-        o(p(A.ye, '\n  Setup cancelled. Run again anytime.\n\n'));
-        process.exit(0);
-      }
-    }
+    // Ink UI is the only supported UI
+    const { runChatUI } = await import('../ui/run-chat-ui.js');
+    await runChatUI();
+    return;
 
-    const cfg = ConfigService.loadConfig();
-    this.sessName = `chat-${Date.now()}`;
-    this.conv.createSession(this.sessName, cfg.apiProvider, this.llm.getModel());
+    // Ink-only: no legacy loop
 
-    // ── Load OPTIMUS.md project context ──
-    this.projectContext = ToolsService.readProjectContext(resolve('.'));
-
-    this._banner();
-
-    if (this.projectContext) {
-      o(p(A.gr, '  📋 Loaded project context from OPTIMUS.md\n'));
-    }
-
-    // ── Auto-connect to MCP servers ──
-    const mcpConfigs = MCPService.loadConfig();
-    if (mcpConfigs.length > 0) {
-      const { connected, failed } = await this.mcpService.connectAll();
-      if (connected.length) {
-        o(p(A.cy, `  🔌 MCP: ${connected.length} server(s) connected`) + p(A.gy, ` — ${this.mcpService.getTools().length} tool(s) available\n`));
-      }
-      for (const f of failed) {
-        o(p(A.re, `  ⚠  MCP "${f.name}" failed: ${f.error.slice(0, 60)}\n`));
-      }
-    }
-
-    // ── Build symbol index in background (non-blocking) ──
-    this._buildIndexBackground();
-    o('\n');
-
-    new Prompt(
-      async (line) => {
-        if (line.startsWith('/')) await this._slash(line);
-        else                       await this._ask(line);
-      },
-      () => {
-        this.conv.saveSession();
-        o('\n' + p(A.gy, `  Session saved › ${this.sessName}\n`) + p(A.ye + A.b, '  Goodbye! 👋\n\n'));
-        process.exit(0);
-      },
-    ).show();
   }
 
   // ─── Auto-init (first-run setup) ───────────────────────────────────────────
@@ -647,6 +653,86 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
 
   // ─── Ask the LLM ────────────────────────────────────────────────────────────
 
+  private _renderStickyHeader() {
+    stickyLayout.renderHeader({
+      model: this.localModelMeta ? `⚡ ${this.localModelMeta.name}` : this.llm.getModel(),
+      tokens: this.tokens,
+      cost: this.cost,
+      toolsEnabled: this.toolsEnabled,
+      planMode: this.planMode,
+      sessionName: this.sessName,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Ink UI adapter API
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Initialize chat engine without starting legacy prompt loop */
+  async _initForInkUI(hooks: NonNullable<Chat['inkHooks']>) {
+    this.inkHooks = hooks;
+    this.llm = new LLMServiceLiteLLM();
+
+    if (!ConfigService.isInitialized()) {
+      // Ink UI can't run interactive init reliably; require user to run init command.
+      throw new Error('Workspace not initialized. Run `optimus init` first.');
+    }
+
+    const cfg = ConfigService.loadConfig();
+    this.sessName = `chat-${Date.now()}`;
+    this.conv.createSession(this.sessName, cfg.apiProvider, this.llm.getModel());
+    this.projectContext = ToolsService.readProjectContext(resolve('.'));
+
+    // Connect MCP and index in background (best effort)
+    try {
+      const mcpConfigs = MCPService.loadConfig();
+      if (mcpConfigs.length > 0) await this.mcpService.connectAll();
+    } catch {}
+
+    this._buildIndexBackground();
+
+    // send state
+    this.inkHooks.onState({
+      tokens: this.tokens,
+      cost: this.cost,
+      model: this.llm.getModel(),
+      sessionName: this.sessName,
+      toolsEnabled: this.toolsEnabled,
+      planMode: this.planMode,
+    });
+  }
+
+  async _handleInkLine(line: string) {
+    if (line.startsWith('/')) return this._slash(line);
+    return this._ask(line);
+  }
+
+  async _inkRegenerateLast() {
+    // naive: re-ask the last user message
+    const lastUser = [...this.msgs].reverse().find((m) => m.role === 'user');
+    if (!lastUser || typeof lastUser.content !== 'string') return;
+    await this._ask(lastUser.content);
+  }
+
+  async _inkTogglePinLast() {
+    const s = this.conv.getCurrentSession();
+    if (!s) return;
+    const last = [...s.messages].reverse().find((m) => m.role === 'assistant' || m.role === 'user');
+    if (!last) return;
+    last.pinned = !last.pinned;
+    this.conv.saveSession();
+  }
+
+  async _inkReactLast(reaction: 'up' | 'down') {
+    const s = this.conv.getCurrentSession();
+    if (!s) return;
+    const last = [...s.messages].reverse().find((m) => m.role === 'assistant');
+    if (!last) return;
+    last.reactions ??= [];
+    if (!last.reactions.includes(reaction)) last.reactions.push(reaction);
+    this.conv.saveSession();
+  }
+
   private async _ask(line: string) {
     // ── Check for Vision (images) ──
     const imagePaths: string[] = [];
@@ -706,6 +792,9 @@ ${plan}`,
     let fullFinal = '';
     let started   = false;
 
+    // For approach (1): buffer assistant output and render with markdown once complete.
+    let visibleAssistantRaw = '';
+
     const modelLabel = this.localModelMeta
       ? this.localModelMeta.name
       : 'Optimus';
@@ -719,24 +808,29 @@ ${plan}`,
       try {
         const svc = this.localModelService;
         const res = await svc.completeWithHistory(this.msgs, {
-          onChunk:    (chunk) => { firstContent(); o(chunk); fullFinal += chunk; },
+          onChunk:    (chunk) => { firstContent(); visibleAssistantRaw += chunk; fullFinal += chunk; },
           onError:    (err)   => { firstContent(); o(p(A.re, `\n  ⚠  ${err.message}`)); },
           onComplete: (r)     => {
             if (!fullFinal) fullFinal = r.content;
+            if (!visibleAssistantRaw) visibleAssistantRaw = r.content;
             if (r.tokensUsed) this.tokens += r.tokensUsed.total;
           },
         });
         if (!fullFinal) {
           fullFinal = res.content;
+          visibleAssistantRaw = res.content;
           firstContent();
-          o(fullFinal);
         }
-        o('\n');
+
+        // Render buffered assistant message as markdown (approach 1)
+        const rendered = markdownRenderer.render(visibleAssistantRaw);
+        o(rendered + '\n');
         this.msgs.push({ role: 'assistant', content: fullFinal });
         this.conv.addMessage('assistant', fullFinal);
         this.conv.updateMetadata(0, 0);
         this.conv.saveSession();
         this._statusLine();
+        this._renderStickyHeader();
       } catch (e: any) {
         firstContent();
         o('\n' + p(A.re, `  ⚠  ${e.message}\n`));
@@ -765,10 +859,15 @@ ${plan}`,
       }
       this.lastTools = tools;
 
+      let turnDeltaTokens = 0;
+      let turnDeltaCost = 0;
+
       while (loops < MAX_LOOPS) {
         loops++;
         let full    = '';
         started     = false;
+        let deltaTokens = 0;
+        let deltaCost = 0;
 
         let filterBuf = '';
         let filterIn  = false;
@@ -803,16 +902,23 @@ ${plan}`,
               filterIn = false;
             }
           }
-          if (out) { firstContent(); o(out); }
+          if (out) { firstContent(); /* approach 1: buffer only */ visibleAssistantRaw += out; }
         };
 
         const res = await this.llm.completeWithHistory(msgs, {
           onChunk:    (chunk) => { filterChunk(chunk); full += chunk; },
-          onComplete: (r)     => { this.tokens += r.tokensUsed.total; this.cost += r.cost.total; },
+          onComplete: (r)     => {
+            this.tokens += r.tokensUsed.total;
+            this.cost += r.cost.total;
+            deltaTokens += r.tokensUsed.total;
+            deltaCost += r.cost.total;
+            turnDeltaTokens += r.tokensUsed.total;
+            turnDeltaCost += r.cost.total;
+          },
           onError:    (err)   => { firstContent(); o(p(A.re, `\n  ⚠  ${err.message}`)); },
         });
 
-        if (!filterIn && filterBuf) { firstContent(); o(filterBuf); }
+        if (!filterIn && filterBuf) { firstContent(); visibleAssistantRaw += filterBuf; }
         filterBuf = ''; filterIn = false;
 
         firstContent();
@@ -822,9 +928,13 @@ ${plan}`,
             .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
             .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
             .trim();
-          if (clean) o(clean);
+          if (clean) visibleAssistantRaw += clean;
           this.tokens += res.tokensUsed.total;
           this.cost   += res.cost.total;
+          deltaTokens += res.tokensUsed.total;
+          deltaCost += res.cost.total;
+          turnDeltaTokens += res.tokensUsed.total;
+          turnDeltaCost += res.cost.total;
         }
 
         msgs.push({ role: 'assistant', content: full });
@@ -872,10 +982,10 @@ ${plan}`,
           } else {
             Spinner.notify(`  🔧 ${call.name}(${argHint})`);
           }
-          const ts = new Spinner('Running');
-          ts.start(); started = false;
+          toolExecutorUI.start(`Running ${call.name}${argHint ? ` (${argHint})` : ''}`);
           const result = await tools.execute(call);
-          ts.stop('Optimus');
+          if (result.error) toolExecutorUI.fail(`${call.name} failed`);
+          else toolExecutorUI.succeed(`${call.name} complete`);
           resultParts.push(ToolsService.formatToolResult(result));
           if (call.name !== 'write_file' && call.name !== 'edit_file') {
             o(p(A.gy, `  ❖ ${(result.output || result.error || '').slice(0, 120)}\n`));
@@ -889,9 +999,20 @@ ${plan}`,
         started = true;
       }
 
-      o('\n');
+      // Render assistant response once (approach 1)
+      const cleanedForDisplay = visibleAssistantRaw
+        .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
+        .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
+        .trim();
+      if (cleanedForDisplay) {
+        o('\n' + markdownRenderer.render(cleanedForDisplay) + '\n');
+      } else {
+        o('\n');
+      }
 
-      // ── Changes panel ──────────────────────────────────────────
+      // ── Changes panel + diffs (Phase 5) ───────────────────────────────────
+      const toolRunId = `toolrun-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const inkDiffs: any[] = [];
       if (tools.written.length) {
         const W  = 54;
         const HR = '─'.repeat(W);
@@ -904,10 +1025,31 @@ ${plan}`,
           const lineTxt = p(A.gy, `${f.lines} lines`);
           const pathTxt = p(A.wh + A.b, f.path);
           o(p(A.gr + A.b, '  │') + `  ${badge}  ${pathTxt}  ${lineTxt}\n`);
+
+          // Render diff if we have a snapshot
+          const snap = tools.snapshots.find(s => s.relPath.replace(/\\/g, '/') === f.path.replace(/\\/g, '/'));
+          if (snap) {
+            try {
+              const after = fsReadFileSync(f.absPath, 'utf-8');
+              const before = snap.content ?? '';
+              const { diffText, stats } = renderUnifiedDiff({ filePath: f.path, before, after, context: 3 });
+              o(p(A.gy, `\n  Δ ${f.path} (+${stats.insertions} -${stats.deletions})\n`));
+              o(diffText.split('\n').map(l => '  ' + l).join('\n') + '\n\n');
+              inkDiffs.push({ path: f.path, diffText, insertions: stats.insertions, deletions: stats.deletions, toolRunId });
+            } catch {
+              // ignore diff failures
+            }
+          }
         }
         o(p(A.gr + A.b, `  ├${HR}┤\n`));
         o(p(A.gr + A.b, '  │') + p(A.gy, `  ${tools.written.length} file(s) written`) + p(A.gy, ' • /undo to revert') + '\n');
         o(p(A.gr + A.b, `  └${HR}┘\n\n`));
+      }
+
+      // Ink UI: emit tool run diffs + snapshots for per-run review
+      if (this.inkHooks && inkDiffs.length) {
+        this.inkHooks.onDiffs(inkDiffs);
+        this.inkHooks.onSnapshots(toolRunId, tools.snapshots);
       }
 
       // ── Clean final message for UI & History ──
@@ -918,7 +1060,7 @@ ${plan}`,
         .trim();
 
       this.msgs.push({ role: 'assistant', content: saveString });
-      this.conv.addMessage('assistant', saveString);
+      this.conv.addMessage('assistant', saveString, { tokensDelta: turnDeltaTokens, costDelta: turnDeltaCost });
       this.conv.updateMetadata(this.tokens, this.cost);
       this.conv.saveSession();
       this._statusLine();
@@ -1076,6 +1218,95 @@ ${plan}`,
       }
 
       // /exit ──────────────────────────────────────────────────────
+      case '/export': {
+        const format = rest[0] as 'md' | 'json' | undefined;
+        const outPath = rest.slice(1).join(' ').trim();
+        if (!format || !outPath) {
+          o(p(A.re, '  ⚠  Usage: /export <md|json> <path>\n'));
+          break;
+        }
+
+        const session = this.conv.getCurrentSession();
+        if (!session) {
+          o(p(A.ye, '  ⚠  No active session to export.\n'));
+          break;
+        }
+
+        try {
+          const { writeFileSync } = await import('fs');
+          if (format === 'json') {
+            writeFileSync(outPath, JSON.stringify(session, null, 2), 'utf-8');
+          } else {
+            const lines: string[] = [];
+            lines.push(`# ${session.name}`);
+            lines.push('');
+            for (const m of session.messages) {
+              const who = m.role === 'user' ? 'You' : m.role === 'assistant' ? 'Optimus' : 'System';
+              lines.push(`## ${who}`);
+              lines.push('');
+              const txt = Array.isArray(m.content)
+                ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+                : String(m.content);
+              lines.push(txt);
+              lines.push('');
+            }
+            writeFileSync(outPath, lines.join('\n'), 'utf-8');
+          }
+          o(p(A.gr, `  ✔ Exported to ${outPath}\n`));
+        } catch (e: any) {
+          o(p(A.re, `  ⚠  Export failed: ${e.message}\n`));
+        }
+        break;
+      }
+
+      case '/tag': {
+        const tag = rest.join(' ').trim();
+        if (!tag) {
+          o(p(A.re, '  ⚠  Usage: /tag <name>\n'));
+          break;
+        }
+        const session = this.conv.getCurrentSession();
+        if (!session) {
+          o(p(A.ye, '  ⚠  No active session.\n'));
+          break;
+        }
+        const last = [...session.messages].reverse().find((m) => m.role === 'assistant' || m.role === 'user');
+        if (!last) {
+          o(p(A.ye, '  ⚠  No message to tag yet.\n'));
+          break;
+        }
+        last.tags ??= [];
+        if (!last.tags.includes(tag)) last.tags.push(tag);
+        this.conv.saveSession();
+        o(p(A.gr, `  ✔ Tagged message with: ${tag}\n`));
+        break;
+      }
+
+      case '/settings': {
+        const session = this.conv.getCurrentSession();
+        if (!session) {
+          o(p(A.ye, '  ⚠  No active session.\n'));
+          break;
+        }
+        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false };
+
+        const theme = (rest[0] as any) ?? session.settings.theme;
+        const mode = rest[1];
+        const lines = rest[2];
+
+        if (theme === 'dark' || theme === 'light' || theme === 'high-contrast') {
+          session.settings.theme = theme;
+        }
+        if (mode === 'compact') session.settings.compactMode = true;
+        if (mode === 'normal') session.settings.compactMode = false;
+        if (lines === 'lines') session.settings.showLineNumbers = true;
+        if (lines === 'nolines') session.settings.showLineNumbers = false;
+
+        this.conv.saveSession();
+        o(p(A.gr, '  ✔ Settings updated\n'));
+        break;
+      }
+
       case '/exit':
       case '/quit': {
         this.conv.saveSession();

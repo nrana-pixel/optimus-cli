@@ -4,6 +4,8 @@ A Node.js CLI tool that uses AI to generate code based on natural language descr
 
 ## Features
 
+### Code Generator (`code`)
+
 - ✅ **AI Code Generation** - Generate code from natural language descriptions
 - ✅ **Multi-Provider Support** - OpenAI, Anthropic, Google Gemini
 - ✅ **Conversation History** - Auto-continue conversations without flags
@@ -11,6 +13,22 @@ A Node.js CLI tool that uses AI to generate code based on natural language descr
 - ✅ **Token & Cost Tracking** - Monitor API usage and costs
 - ✅ **Streaming Support** - Real-time response streaming
 - ✅ **Error Handling** - Comprehensive error handling and recovery
+
+### Optimus Chat (Ink TUI) (`chat`)
+
+- ✅ **Ink-based terminal UI** with command palette, panels, and toasts
+- ✅ **Search** (in-session + cross-session) with jump + next/prev navigation
+- ✅ **Sessions** (list/load/delete)
+- ✅ **Export/Import** (md/json export with toasts, import session JSON)
+- ✅ **Branching/Threading** (`parentMessageId`, thread root/leaf, sibling selection)
+- ✅ **Diff review** (per-tool-run accept/revert, per-file revert; in-memory snapshot groups)
+- ✅ **Message operations** (edit last/edit any, regenerate in-place, pin/tag/delete/prune)
+- ✅ **Analytics** (usage stats by command, provider/model buckets, cost/tokens per turn)
+- ✅ **Theming** (dark/light/high-contrast; consistent accent borders)
+
+See:
+- `docs/CHAT_UI_IMPLEMENTED_FEATURES.md` (full list)
+- `docs/CHAT_UI_REMAINING_FEATURES.d.md` (completion checklist)
 
 ## Quick Start
 
@@ -74,6 +92,24 @@ node bin/dev.js code "new project" --new-session
 # List sessions
 node bin/dev.js code --list-sessions
 ```
+
+### `chat` - Optimus Chat (Ink TUI)
+Interactive AI coding agent chat UI.
+
+```bash
+node bin/dev.js chat
+```
+
+**Highlights:**
+- Command palette (`/`) with grouped commands + help preview
+- Search (`Ctrl+F`) + cross-session search (`Ctrl+G`)
+- Diffs review (`Ctrl+Y`) with per-tool-run accept/revert
+- Branching/thread view (`Ctrl+T`, `Ctrl+M`, `Ctrl+J`)
+- Export/import sessions (`Ctrl+E`, `Ctrl+N`)
+
+**Docs:**
+- `docs/CHAT_UI_IMPLEMENTED_FEATURES.md` – full feature list + shortcuts
+- `docs/CHAT_UI_REMAINING_FEATURES.d.md` – completion checklist
 
 ### `init` - Initialize Workspace
 Initialize a new workspace with API configuration.

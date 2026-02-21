@@ -7,10 +7,26 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSy
 import { join } from 'path';
 import { homedir } from 'os';
 
+export type MessageReaction = 'up' | 'down';
+
 export interface Message {
+  id: string;
   role: 'user' | 'assistant' | 'system';
   content: string | any[];
   timestamp: string;
+
+  // Enhanced UI metadata (optional for backward compatibility)
+  reactions?: MessageReaction[];
+  pinned?: boolean;
+  editedAt?: string;
+  parentMessageId?: string; // enables simple branching
+  tags?: string[];
+
+  // Analytics metadata (optional)
+  provider?: string;
+  model?: string;
+  tokensDelta?: number;
+  costDelta?: number;
 }
 
 export interface ConversationSession {
@@ -25,7 +41,21 @@ export interface ConversationSession {
     totalTokens: number;
     totalCost: number;
   };
+
+  // Persisted UI settings
+  settings?: {
+    theme?: 'dark' | 'light' | 'high-contrast';
+    compactMode?: boolean;
+    showLineNumbers?: boolean;
+    // Ink UI persisted state
+    recentCommands?: string[];
+    threadRootId?: string | null;
+    threadLeafId?: string | null;
+    usage?: Record<string, number>;
+    provider?: string;
+  };
 }
+
 
 export class ConversationService {
   private static readonly SESSIONS_DIR = join(homedir(), '.multi-agent', 'sessions');
@@ -33,6 +63,23 @@ export class ConversationService {
 
   constructor() {
     this.ensureSessionsDirectory();
+  }
+
+  /** Backward-compatible migration for older session JSON formats */
+  private _migrateSessionInPlace(session: ConversationSession) {
+    // Ensure settings exists
+    session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
+    session.settings.recentCommands ??= [];
+    if (session.settings.threadRootId === undefined) session.settings.threadRootId = null;
+    if (session.settings.threadLeafId === undefined) session.settings.threadLeafId = null;
+    (session.settings as any).usage ??= {};
+    (session.settings as any).provider ??= 'unknown';
+
+    // Ensure message IDs
+    for (const m of session.messages as any[]) {
+      if (!m.id) m.id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      if (!m.timestamp) m.timestamp = new Date().toISOString();
+    }
   }
 
   /**
@@ -79,7 +126,8 @@ export class ConversationService {
       }
 
       const content = readFileSync(filePath, 'utf-8');
-      this.currentSession = JSON.parse(content);
+      this.currentSession = JSON.parse(content) as ConversationSession;
+      this._migrateSessionInPlace(this.currentSession);
       return this.currentSession;
     } catch (error) {
       return null;
@@ -119,15 +167,19 @@ export class ConversationService {
   /**
    * Add a message to the current session
    */
-  addMessage(role: 'user' | 'assistant' | 'system', content: string | any[]): Message {
+  addMessage(role: 'user' | 'assistant' | 'system', content: string | any[], opts?: Partial<Omit<Message, 'id' | 'role' | 'content' | 'timestamp'>>): Message {
     if (!this.currentSession) {
       throw new Error('No active session');
     }
 
     const message: Message = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       role,
       content,
       timestamp: new Date().toISOString(),
+      provider: this.currentSession.metadata.provider,
+      model: this.currentSession.metadata.model,
+      ...opts,
     };
 
     this.currentSession.messages.push(message);
