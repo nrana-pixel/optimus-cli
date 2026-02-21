@@ -1,14 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import SelectInput from 'ink-select-input';
-import { Modal } from './Modal.js';
 import type { FileDiff } from '../types.js';
-
-function iconForDiff(d: FileDiff) {
-  if (d.insertions > 0 && d.deletions === 0) return '+';
-  if (d.deletions > 0 && d.insertions === 0) return '-';
-  return '±';
-}
+import { InlineDiffView } from '../InlineDiffView.js';
 
 export function DiffReviewPanel(props: {
   diffs: FileDiff[];
@@ -21,11 +15,14 @@ export function DiffReviewPanel(props: {
 
   useInput((ch, key) => {
     if (key.escape) props.onClose();
-    if (key.ctrl && ch === 'a') void props.onRevertAll();
-    if (key.ctrl && ch === 'r') {
+    if (key.ctrl && (ch === 'a' || ch === 'A')) void props.onRevertAll();
+    if (key.ctrl && (ch === 'r' || ch === 'R')) {
       if (selectedPath) void props.onRevertFile(selectedPath);
     }
-    if (key.ctrl && ch === 'y') props.onAccept();
+    if (key.ctrl && (ch === 'y' || ch === 'Y')) {
+      props.onAccept();
+      props.onClose();
+    }
   });
 
   const items = useMemo(() => {
@@ -34,7 +31,7 @@ export function DiffReviewPanel(props: {
       .slice(-50)
       .reverse()
       .map((d) => ({
-        label: `${iconForDiff(d)} ${d.path} (+${d.insertions} -${d.deletions})`,
+        label: `${d.path} (+${d.insertions} -${d.deletions})`,
         value: d.path,
       }));
   }, [props.diffs]);
@@ -46,29 +43,50 @@ export function DiffReviewPanel(props: {
   }, [props.diffs, selectedPath]);
 
   return (
-    <Modal title="Diff Review" footer="Ctrl+R revert file · Ctrl+A revert all · Ctrl+Y accept (clear list) · Esc closes">
+    <Box flexDirection="column" paddingX={0} paddingY={0}>
+      <Box marginBottom={1} marginTop={1}>
+        <Text bold color="magenta">● Diff Review </Text>
+        <Text dimColor>(Use ↓/↑ to switch files · Esc/Ctrl+T to close)</Text>
+      </Box>
+
       {items.length === 0 ? (
-        <Text dimColor>No diffs to review</Text>
+        <Box paddingLeft={1} marginBottom={1}>
+          <Text dimColor italic>|_ No changes to review in this session.</Text>
+        </Box>
       ) : (
         <Box flexDirection="column">
-          <SelectInput
-            items={items}
-            onHighlight={(it) => setSelectedPath(String(it.value))}
-            onSelect={async (it) => {
-              const p = String(it.value);
-              setSelectedPath(p);
-              await props.onRevertFile(p);
-            }}
-          />
+          <Box flexDirection="column">
+            {preview && (
+              <InlineDiffView
+                path={preview.path}
+                diffText={preview.diffText}
+                language={preview.path.split('.').pop() || 'text'}
+                full
+              />
+            )}
+          </Box>
+
+          <Box flexDirection="column" marginTop={1} paddingLeft={1}>
+            <Text bold color="magenta"> FILES:</Text>
+            <SelectInput
+              items={items}
+              onHighlight={(it) => setSelectedPath(String(it.value))}
+              onSelect={async (it) => {
+                const p = String(it.value);
+                setSelectedPath(p);
+              }}
+            />
+          </Box>
         </Box>
       )}
 
-      {preview ? (
-        <Box marginTop={1} flexDirection="column">
-          <Text dimColor>Preview: {preview.path}</Text>
-          <Text>{preview.diffText}</Text>
-        </Box>
-      ) : null}
-    </Modal>
+      <Box marginTop={1} marginBottom={1} paddingLeft={1}>
+        <Text dimColor>
+          Ctrl+R <Text color="white">revert</Text> ·
+          Ctrl+A <Text color="white">revert all</Text> ·
+          Ctrl+Y <Text color="white">accept</Text>
+        </Text>
+      </Box>
+    </Box>
   );
 }

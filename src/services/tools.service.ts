@@ -27,6 +27,7 @@ import {
 import { join, resolve, relative, extname, dirname } from 'path';
 import { execSync } from 'child_process';
 import { truncateMiddle } from '../utils/truncate.js';
+import { createTwoFilesPatch } from 'diff';
 import { UnifiedExecService } from './unified-exec.service.js';
 import type { IndexService } from './index.service.js';
 
@@ -315,27 +316,50 @@ export class ToolsService {
     return msg;
   }
 
-  /**
-   * Resilient patch application using SEARCH/REPLACE blocks.
-   * Format:
-   * <<<<<< SEARCH
-   * ...
-   * ======
-   * ...
-   * >>>>>>
-   */
-  private applyPatch(filePath: string, patch: string): string {
-    if (!filePath) return 'apply_patch requires a path argument';
-    if (!patch) return 'apply_patch requires a patch argument';
+  async preview(call: ToolCall): Promise<{ path: string; diffText: string; insertions: number; deletions: number } | null> {
+    const { name, args } = call;
+    const path = args.path;
+    if (!path || !['write_file', 'edit_file', 'apply_patch'].includes(name)) return null;
 
-    const abs = resolve(this.workingDir, filePath);
-    if (!existsSync(abs)) return `File not found: ${filePath}`;
-
-    const original = readFileSync(abs, 'utf-8');
+    const abs = resolve(this.workingDir, path);
     const rel = relative(this.workingDir, abs);
+    
+    let oldContent = '';
+    let newContent = '';
+    
+    try {
+      if (existsSync(abs)) {
+        oldContent = readFileSync(abs, 'utf-8');
+      }
 
+      if (name === 'write_file') {
+        newContent = args.content ?? '';
+      } else if (name === 'edit_file') {
+        const toFind = args.old_content ?? '';
+        const toReplace = args.new_content ?? '';
+        if (!oldContent.includes(toFind)) return null;
+        newContent = oldContent.split(toFind).join(toReplace);
+      } else if (name === 'apply_patch') {
+        const patch = args.patch ?? '';
+        const result = this._calculatePatch(oldContent, patch);
+        if (typeof result === 'string') return null; // error message
+        newContent = result.content;
+      }
+
+      const diffText = createTwoFilesPatch(path, path, oldContent, newContent, '', '', { context: 3 });
+      const lines = diffText.split('\n');
+      const insertions = lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
+      const deletions = lines.filter(l => l.startsWith('-') && !l.startsWith('---')).length;
+
+      return { path, diffText, insertions, deletions };
+    } catch {
+      return null;
+    }
+  }
+
+  private _calculatePatch(original: string, patch: string): { content: string; count: number } | string {
     const blocks = patch.split('<<<<<< SEARCH');
-    if (blocks.length <= 1) return 'apply_patch failed: No SEARCH/REPLACE blocks found. Use the format: <<<<<< SEARCH\\n...\\n======\\n...\\n>>>>>>';
+    if (blocks.length <= 1) return 'No blocks';
 
     let currentContent = original;
     let appliedCount = 0;
@@ -352,26 +376,34 @@ export class ToolsService {
 
       const replacePart = replaceParts[0].trim();
 
-      // Try exact match first
       if (currentContent.includes(searchPart)) {
         currentContent = currentContent.replace(searchPart, replacePart);
         appliedCount++;
       } else {
-        // Try fuzzy match (ignore indentation)
-        const normalize = (s: string) => s.split('\n').map(l => l.trim()).filter(Boolean).join('\n');
-        const normalizedSearch = normalize(searchPart);
-        
-        // This is a simplified fuzzy match. A real one would use regex or diffing.
-        // For now, let's just stick to a slightly smarter exact match.
-        return `apply_patch failed: Could not find SEARCH block in ${filePath}. Check whitespace and indentation.`;
+        return `Could not find SEARCH block`;
       }
     }
+    return { content: currentContent, count: appliedCount };
+  }
 
-    if (appliedCount > 0) {
+  private applyPatch(filePath: string, patch: string): string {
+    if (!filePath) return 'apply_patch requires a path argument';
+    if (!patch) return 'apply_patch requires a patch argument';
+
+    const abs = resolve(this.workingDir, filePath);
+    if (!existsSync(abs)) return `File not found: ${filePath}`;
+
+    const original = readFileSync(abs, 'utf-8');
+    const rel = relative(this.workingDir, abs);
+
+    const result = this._calculatePatch(original, patch);
+    if (typeof result === 'string') return `apply_patch failed: ${result}`;
+
+    if (result.count > 0) {
       this._snapshot(abs, rel);
-      writeFileSync(abs, currentContent, 'utf-8');
-      this.written.push({ path: filePath, absPath: abs, lines: currentContent.split('\n').length, isNew: false });
-      return `Applied ${appliedCount} patch block(s) to ${filePath}`;
+      writeFileSync(abs, result.content, 'utf-8');
+      this.written.push({ path: filePath, absPath: abs, lines: result.content.split('\n').length, isNew: false });
+      return `Applied ${result.count} patch block(s) to ${filePath}`;
     }
 
     return 'apply_patch failed: No blocks were successfully applied.';

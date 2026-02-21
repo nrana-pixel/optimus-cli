@@ -46,7 +46,7 @@ export function HeaderBar(props: {
           <Box marginTop={0}>
             <Text dimColor> {props.cwd || process.cwd()} </Text>
             {props.branch && (
-              <Text color="magenta">  {props.branch} </Text>
+              <Text color="magenta"> branch: {props.branch} </Text>
             )}
           </Box>
         </Box>

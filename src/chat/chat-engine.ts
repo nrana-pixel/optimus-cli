@@ -30,7 +30,7 @@ export type InkHooks = {
   onTools: (t: ToolRun[]) => void;
   onDiffs: (d: FileDiff[]) => void;
   onSnapshots: (toolRunId: string, snapshots: any[]) => void;
-  onPermissionRequest: (calls: any[]) => Promise<PermissionResult>;
+  onPermissionRequest: (calls: any[], previews?: FileDiff[]) => Promise<PermissionResult>;
 };
 
 export class ChatEngine {
@@ -315,21 +315,33 @@ export class ChatEngine {
       msgs.push({ role: 'assistant', content: full });
       this.msgs.push({ role: 'assistant', content: full });
       
-      this.conv.addMessage('assistant', full, { tokensDelta: res.tokensUsed.total, costDelta: res.cost.total });
+      this.conv.addMessage('assistant', full, { id: assistantMsgId, tokensDelta: res.tokensUsed.total, costDelta: res.cost.total });
       this.conv.updateMetadata(this.tokens, this.cost);
       this.conv.saveSession();
 
       // Helper to generate diffs for messages
-      const getDiffBlocks = async (newWritten: any[]) => {
+      const getDiffBlocks = async (files: any[]) => {
         const blocks: any[] = [];
-        for (const writtenFile of newWritten) {
+        for (const writtenFile of files) {
           try {
-            const snapshot = tools.snapshots.find(s => s.absPath === writtenFile.absPath);
+            const snapshot = this.lastTools?.snapshots.find(s => s.absPath === writtenFile.absPath);
             const oldContent = snapshot?.existed ? snapshot.content || '' : '';
             const { readFileSync } = await import('fs');
             const newContent = readFileSync(writtenFile.absPath, 'utf-8');
             const diffText = createTwoFilesPatch(writtenFile.path, writtenFile.path, oldContent, newContent, '', '', { context: 3 });
-            blocks.push({ type: 'diff', path: writtenFile.path, diffText, language: writtenFile.path.split('.').pop() || 'text' });
+            
+            const lines = diffText.split('\n');
+            const insertions = lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
+            const deletions = lines.filter(l => l.startsWith('-') && !l.startsWith('---')).length;
+
+            blocks.push({ 
+                type: 'diff', 
+                path: writtenFile.path, 
+                diffText, 
+                language: writtenFile.path.split('.').pop() || 'text',
+                insertions,
+                deletions
+            });
           } catch { }
         }
         return blocks;
@@ -340,16 +352,22 @@ export class ChatEngine {
         .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
         .trim();
 
-      const newWritten = tools.written.slice(turnWrittenCount);
+      const turnWritten = tools.written.slice(turnWrittenCount);
       turnWrittenCount = tools.written.length;
-      const diffBlocks = await getDiffBlocks(newWritten);
+      
+      const diffBlocks = await getDiffBlocks(turnWritten);
+      const assistantContentBlocks = [{ type: 'text', text: cleanedFinal }, ...diffBlocks];
 
       this.inkHooks?.onMessage({
         id: assistantMsgId,
         role: 'assistant',
-        content: [{ type: 'text', text: cleanedFinal }, ...diffBlocks],
+        content: assistantContentBlocks,
         timestamp: new Date().toISOString(),
       } as any);
+
+      // Persist the cleaned version with diffs for the UI
+      this.conv.updateMessage(assistantMsgId, { content: assistantContentBlocks });
+      this.conv.saveSession();
 
       if (!this.toolsEnabled) break;
       const toolCalls = res.toolCalls || [];
@@ -366,7 +384,17 @@ export class ChatEngine {
 
       if (needsPermission) {
         const permMsgId = `msg-${Date.now()}-perm-${loops}`;
-        const permContent = [{ type: 'permission-request', calls: toolCalls, status: 'pending' as const }];
+        
+        // Generate previews
+        const previewResults = await Promise.all(toolCalls.map(c => tools.preview(c as any)));
+        const previewDiffs = previewResults.filter((r): r is NonNullable<typeof r> => r !== null);
+
+        const permContent = [{ 
+            type: 'permission-request', 
+            calls: toolCalls, 
+            status: 'pending' as const,
+            previewDiffs 
+        }];
         
         this.inkHooks?.onMessage({
           id: permMsgId,
@@ -378,7 +406,7 @@ export class ChatEngine {
         this.conv.addMessage('system', permContent, { id: permMsgId });
         this.conv.saveSession();
 
-        const result = await this.inkHooks!.onPermissionRequest(toolCalls);
+        const result = await this.inkHooks!.onPermissionRequest(toolCalls, previewDiffs as any);
         let decisionStatus: 'approved' | 'denied' = 'approved';
 
         if (result === 'no') {
@@ -412,19 +440,53 @@ export class ChatEngine {
 
       // Execute Tools
       let hasError = false;
+      const toolRuns: ToolRun[] = [];
       const resultPromises = toolCalls.map(async (call) => {
+        const startedAt = Date.now();
+        const trId = `tool-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        
+        // Emit running status
+        toolRuns.push({ id: trId, name: call.name, label: call.name, status: 'running', startedAt });
+        this.inkHooks?.onTools([...toolRuns]);
+
+        let result: any;
         if (this.mcpService.isMCPTool(call.name)) {
           const mcpResult = await this.mcpService.callTool(call.name, call.args as Record<string, unknown>);
           if (mcpResult.isError) hasError = true;
-          return `<tool_result>\n<name>${call.name}</name>\n<output>\n${mcpResult.isError ? `ERROR: ${mcpResult.content}` : mcpResult.content}\n</output>\n</tool_result>`;
+          result = { output: mcpResult.content, error: mcpResult.isError ? mcpResult.content : undefined };
+        } else {
+          result = await tools.execute({ name: call.name as any, args: call.args });
+          if (result.error || (call.name === 'run_command' && result.output.includes('Command failed:'))) hasError = true;
         }
-        const result = await tools.execute({ name: call.name as any, args: call.args });
-        if (result.error || (call.name === 'run_command' && result.output.includes('Command failed:'))) hasError = true;
-        return ToolsService.formatToolResult(result);
+
+        // Update tool run status
+        const runIdx = toolRuns.findIndex(r => r.id === trId);
+        if (runIdx >= 0) {
+            toolRuns[runIdx].status = result.error ? 'error' : 'success';
+            toolRuns[runIdx].endedAt = Date.now();
+            toolRuns[runIdx].error = result.error;
+            this.inkHooks?.onTools([...toolRuns]);
+        }
+
+        return ToolsService.formatToolResult({
+            name: call.name as any,
+            args: call.args,
+            output: result.output || '',
+            error: result.error,
+            durationMs: Date.now() - startedAt
+        });
       });
 
       const resultParts = await Promise.all(resultPromises);
       this.lastTurnHadError = hasError;
+
+      // Update global diffs for the UI (DiffPanel)
+      const postToolWritten = tools.written.slice(turnWrittenCount);
+      if (postToolWritten.length > 0) {
+          const diffs = await getDiffBlocks(postToolWritten);
+          this.inkHooks?.onDiffs(diffs as any);
+      }
+
       msgs.push({ role: 'user', content: resultParts.join('\n\n') + '\n\nContinue with your response.' });
     }
     

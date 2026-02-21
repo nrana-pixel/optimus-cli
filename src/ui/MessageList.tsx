@@ -6,38 +6,26 @@ import { InlineDiffView } from './InlineDiffView.js';
 import { TurnSeparator } from './TurnSeparator.js';
 
 function roleLabel(theme: ReturnType<typeof useTheme>, role: UIMessage['role']) {
-  if (role === 'user') return { label: '👤 YOU', color: theme.user as any };
-  if (role === 'assistant') return { label: '🤖 OPTIMUS', color: theme.assistant as any };
-  return { label: '⚙️ SYSTEM', color: theme.dim as any };
+  if (role === 'user') return { label: '● YOU', color: 'white' };
+  if (role === 'assistant') return { label: '● OPTIMUS', color: 'green' };
+  return { label: '● SYSTEM', color: 'gray' };
 }
 
 function renderPermissionRequest(block: Extract<ContentBlock, { type: 'permission-request' }>) {
-  const theme = useTheme();
-  const statusColors = {
-    pending: 'yellow',
-    approved: 'green',
-    denied: 'red'
-  };
-  const statusText = block.status === 'pending' ? 'PENDING APPROVAL' : block.status?.toUpperCase();
+  const label = block.status === 'pending' ? 'WAITING' : block.status?.toUpperCase();
+  const color = block.status === 'approved' ? 'green' : (block.status === 'denied' ? 'red' : 'gray');
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={statusColors[block.status || 'pending'] as any} paddingX={1} marginY={1}>
-      <Box flexDirection="row" justifyContent="space-between">
-        <Text bold color={statusColors[block.status || 'pending'] as any}>
-          🛡️ PERMISSION REQUEST
-        </Text>
-        <Text bold color={statusColors[block.status || 'pending'] as any}>
-          [{statusText}]
-        </Text>
+    <Box flexDirection="column">
+      <Box paddingLeft={2} marginY={0}>
+        <Text color={color as any}>[{label}]</Text>
+        <Text dimColor> tools: {block.calls.map(c => c.name).join(', ')}</Text>
       </Box>
-      <Box flexDirection="column" marginTop={1}>
-        <Text>Optimus wants to use these tools:</Text>
-        {block.calls.map((call, i) => (
-          <Box key={i} marginLeft={2}>
-            <Text color="cyan">→ {call.name}</Text>
-          </Box>
-        ))}
-      </Box>
+      {block.status !== 'pending' && block.previewDiffs?.map((d, i) => (
+        <Box key={i} marginTop={1}>
+          <InlineDiffView path={d.path} diffText={d.diffText} language={d.path.split('.').pop() || 'text'} />
+        </Box>
+      ))}
     </Box>
   );
 }
@@ -64,41 +52,37 @@ export function MessageList(props: {
   compactMode: boolean;
   anchorMessageId?: string | null;
   maxMessages?: number;
+  columns: number;
 }) {
   const theme = useTheme();
   const { messages, compactMode, maxMessages = 200, anchorMessageId } = props;
   const visible = useMemo(() => messages.slice(-maxMessages), [messages, maxMessages]);
 
   return (
-    <Box flexDirection="column" marginTop={1}>
+    <Box flexDirection="column">
       {visible.map((m, index) => {
         const r = roleLabel(theme, m.role);
         const reactions = (m.reactions ?? []).length
-          ? `  (${(m.reactions ?? []).includes('up') ? '👍' : ''}${(m.reactions ?? []).includes('down') ? '👎' : ''})`
+          ? ` (${(m.reactions ?? []).includes('up') ? '+' : ''}${(m.reactions ?? []).includes('down') ? '-' : ''})`
           : '';
-        const pin = m.pinned ? '📌 ' : '';
+        const pin = m.pinned ? '[P] ' : '';
 
         const isAnchor = Boolean(anchorMessageId && m.id === anchorMessageId);
 
-        // Show separator if this is a user message following an assistant message
-        const showSeparator = index > 0 && m.role === 'user' && visible[index - 1].role === 'assistant';
-
         return (
           <React.Fragment key={m.id}>
-            {showSeparator && <TurnSeparator activitySummary="Done" />}
             <Box
               flexDirection="column"
               marginBottom={compactMode ? 0 : 1}
-              borderStyle={isAnchor ? 'round' : undefined}
-              borderColor={isAnchor ? (theme.user as any) : undefined}
-              paddingX={isAnchor ? 1 : 0}
+              paddingX={0}
             >
               <Box flexDirection="row">
-                <Text bold color={r.color}>
+                <Text bold color={r.color as any}>
                   {pin}{r.label}
                 </Text>
                 <Text dimColor>{reactions}</Text>
-                {m.editedAt ? <Text dimColor>{'  (edited)'}</Text> : null}
+                {m.editedAt ? <Text dimColor>{' (edited)'}</Text> : null}
+                {isAnchor && <Text color="yellow"> [FOCUS]</Text>}
               </Box>
               <Box flexDirection="column" marginTop={0}>
                 {m.content.map((block, i) => (

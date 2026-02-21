@@ -73,7 +73,7 @@ export interface ChatAppProps {
     usage: Record<string, number>;
     provider: string;
     isGenerating: boolean;
-    pendingPermission: { calls: any[], resolve: (v: import('../chat/chat-engine.js').PermissionResult) => void } | null;
+    pendingPermission: { calls: any[], previews?: FileDiff[], resolve: (v: import('../chat/chat-engine.js').PermissionResult) => void } | null;
     branch?: string;
     cwd?: string;
   };
@@ -198,14 +198,14 @@ export function ChatApp(props: ChatAppProps) {
     setScrollOffset((o) => Math.min(Math.max(o, 0), Math.max(0, viewMessages.length - 1)));
   }, [viewMessages.length]);
 
-  const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || toolRunsOpen || diffReviewOpen || siblingsOpen || tagOpen || editAssistantOpen || deleteMsgOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen;
+  const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || toolRunsOpen || siblingsOpen || tagOpen || editAssistantOpen || deleteMsgOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen;
 
   const dynamicHint = useMemo(() => {
-    if (state.pendingPermission) return 'Y/N/A to approve tools, or type feedback.';
+    if (state.pendingPermission) return 'Select an option or Esc to deny.';
+    if (diffReviewOpen) return 'Esc or Ctrl+T to return to chat. Use ↑/↓ to browse files.';
     if (anyModal) return 'Esc to close overlay, ↑/↓ to navigate, Enter to select.';
-    if (state.isGenerating) return 'Generating...';
-    return 'Ctrl+F Search • / Commands • ? Help • ↑↓ Scroll • Ctrl+C Exit';
-  }, [state.pendingPermission, anyModal, state.isGenerating]);
+    return 'Ctrl+T Diffs · Ctrl+F Search · / Commands · ? Help · ↑↓ Scroll · Ctrl+C Exit';
+  }, [state.pendingPermission, anyModal, diffReviewOpen]);
 
   const submit = useCallback(async () => {
     const v = input.trim();
@@ -281,14 +281,14 @@ export function ChatApp(props: ChatAppProps) {
     if (key.ctrl && (ch === 'b' || ch === 'B')) setPinsOpen(true);
     if (key.ctrl && (ch === 'g' || ch === 'G')) setSearchAllOpen(true);
     if (key.ctrl && (ch === 'i' || ch === 'I')) setAnalyticsOpen(true);
-    if (key.ctrl && (ch === 't' || ch === 'T')) setBranchOpen(true);
+    if (key.ctrl && (ch === 't' || ch === 'T')) setDiffReviewOpen(!diffReviewOpen);
     if (key.ctrl && (ch === 'l' || ch === 'L')) {
       setThreadRootId(null);
       setThreadLeafId(null);
     }
     if (key.ctrl && (ch === 'm' || ch === 'M')) setBranchesOpen(true);
     if (key.ctrl && (ch === 'y' || ch === 'Y')) {
-      setToolRunsOpen(true);
+      setBranchOpen(true);
     }
     if (key.ctrl && (ch === 'k' || ch === 'K')) setEditMessageOpen(true);
     if (key.ctrl && (ch === 'j' || ch === 'J')) setSiblingsOpen(true);
@@ -396,9 +396,9 @@ export function ChatApp(props: ChatAppProps) {
       />
 
       {anchorMessageId ? (
-        <Box borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1} display={anyModal ? 'none' : 'flex'}>
-          <Text dimColor>
-            Jumped to a search hit. Ctrl+Z to return. Ctrl+Shift+N/P to cycle hits.
+        <Box paddingX={1} marginTop={1} display={anyModal ? 'none' : 'flex'}>
+          <Text dimColor italic>
+            ● Focus mode: Ctrl+Z to return · Ctrl+Shift+N/P to cycle
           </Text>
         </Box>
       ) : null}
@@ -406,16 +406,13 @@ export function ChatApp(props: ChatAppProps) {
       <Box flexDirection="column" display={anyModal ? 'none' : 'flex'}>
         {viewMessages.length === 0 ? (
           <Box marginX={1} marginTop={1} flexShrink={0}>
-            <Box borderStyle="round" borderColor={theme.accent as any} paddingX={1}>
-              <Text dimColor>Quick actions: </Text>
-              <Text color={theme.accent as any}>[Summarize repo]</Text>
-              <Text> </Text>
-              <Text color={theme.accent as any}>[Find bugs]</Text>
-              <Text> </Text>
-              <Text color={theme.accent as any}>[Add tests]</Text>
-              <Text> </Text>
-              <Text dimColor>[Type / for commands]</Text>
-            </Box>
+            <Text dimColor>● Quick start: </Text>
+            <Text color="cyan">summarize</Text>
+            <Text dimColor> · </Text>
+            <Text color="cyan">bugs</Text>
+            <Text dimColor> · </Text>
+            <Text color="cyan">tests</Text>
+            <Text dimColor>  (Type / for commands)</Text>
           </Box>
         ) : null}
         {(() => {
@@ -457,6 +454,7 @@ export function ChatApp(props: ChatAppProps) {
                     messages={slice}
                     compactMode={settings.compactMode}
                     anchorMessageId={anchorMessageId}
+                    columns={columns}
                   />
                   {state.pendingPermission && (
                     <PermissionPanel
@@ -501,16 +499,39 @@ export function ChatApp(props: ChatAppProps) {
 
           const start = Math.max(0, startIdx + 1);
 
+          if (diffReviewOpen) {
+            return (
+              <DiffReviewPanel
+                diffs={selectedToolRunId ? (state.diffGroups[selectedToolRunId] ?? []) : state.diffs}
+                onClose={() => setDiffReviewOpen(false)}
+                onRevertFile={async (path) => {
+                  await props.onSubmit(`/revert-file ${path}`);
+                }}
+                onRevertAll={async () => {
+                  if (selectedToolRunId) await props.onSubmit(`/revert-run ${selectedToolRunId}`);
+                  else await props.onSubmit('/revert-all');
+                }}
+                onAccept={() => {
+                  if (selectedToolRunId) void props.onSubmit(`/accept-run ${selectedToolRunId}`);
+                  else void props.onSubmit('/accept-diffs');
+                  setDiffReviewOpen(false);
+                }}
+              />
+            );
+          }
+
           return (
             <>
               <MessageList
                 messages={slice}
                 compactMode={settings.compactMode}
                 anchorMessageId={null}
+                columns={columns}
               />
               {state.pendingPermission && (
                 <PermissionPanel
                   calls={state.pendingPermission.calls}
+                  previews={state.pendingPermission.previews}
                   onApprove={props.onApproveTools}
                   onDeny={props.onDenyTools}
                   onAlways={props.onAlwaysApprove}
@@ -535,7 +556,6 @@ export function ChatApp(props: ChatAppProps) {
           onCancel={() => setPaletteOpen(false)}
           onSelect={async (cmd) => {
             setPaletteOpen(false);
-            await props.onSubmit(`/ recent - cmd ${cmd} `);
 
             // local-only commands
             if (cmd === '/search') {
@@ -649,7 +669,7 @@ export function ChatApp(props: ChatAppProps) {
           defaultPath={`./ ${props.sessionName}.md`}
           onClose={() => setExportOpen(false)}
           onExport={async (format, path) => {
-            await props.onSubmit(`/export -ui ${format} ${path} `);
+            await props.onSubmit(`/export-ui ${format} ${path}`);
           }}
         />
       ) : null}
@@ -660,7 +680,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setSettingsOpen(false)}
           onUpdate={async (next) => {
             setSettings(next);
-            await props.onSubmit(`/ settings ${next.theme} ${next.compactMode ? 'compact' : 'normal'} ${next.showLineNumbers ? 'lines' : 'nolines'} `);
+            await props.onSubmit(`/settings ${next.theme} ${next.compactMode ? 'compact' : 'normal'} ${next.showLineNumbers ? 'lines' : 'nolines'}`);
           }}
         />
       ) : null}
@@ -670,11 +690,11 @@ export function ChatApp(props: ChatAppProps) {
           sessions={state.sessions}
           onClose={() => setSessionsOpen(false)}
           onLoad={async (id) => {
-            await props.onSubmit(`/ load - session ${id} `);
+            await props.onSubmit(`/load-session ${id}`);
             setSessionsOpen(false);
           }}
           onDelete={async (id) => {
-            await props.onSubmit(`/ delete -session ${id} `);
+            await props.onSubmit(`/delete-session ${id}`);
           }}
         />
       ) : null}
@@ -698,7 +718,7 @@ export function ChatApp(props: ChatAppProps) {
           })()}
           onClose={() => setEditLastOpen(false)}
           onSubmit={async (newText) => {
-            await props.onSubmit(`/ edit - last ${JSON.stringify(newText)} `);
+            await props.onSubmit(`/edit-last ${JSON.stringify(newText)}`);
           }}
         />
       ) : null}
@@ -708,7 +728,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setEditMessageOpen(false)}
           onEditAndBranch={async (messageId, newContent) => {
-            await props.onSubmit(`/ edit - branch ${messageId} ${JSON.stringify(newContent)} `);
+            await props.onSubmit(`/edit-branch ${messageId} ${JSON.stringify(newContent)}`);
             setThreadRootId(messageId);
           }}
         />
@@ -732,11 +752,10 @@ export function ChatApp(props: ChatAppProps) {
           hits={state.globalHits}
           onClose={() => setSearchAllOpen(false)}
           onQuery={async (q) => {
-            const res = await props.onSubmit(`/ search - all ${JSON.stringify(q)} `);
-            void res;
+            await props.onSubmit(`/search-all ${JSON.stringify(q)}`);
           }}
           onSelect={async (hit) => {
-            await props.onSubmit(`/ load - session ${hit.sessionId} `);
+            await props.onSubmit(`/load-session ${hit.sessionId}`);
             setAnchorMessageId(hit.messageId);
             setSearchAllOpen(false);
           }}
@@ -748,8 +767,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setBranchOpen(false)}
           onSelectParent={async (parentId) => {
-            // Start branch: controller will set a thread root and next message will reference parent
-            await props.onSubmit(`/ branch ${parentId} `);
+            await props.onSubmit(`/branch ${parentId}`);
             setThreadRootId(parentId);
           }}
         />
@@ -761,7 +779,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setBranchesOpen(false)}
           onSelectThread={async (rootId) => {
             setThreadRootId(rootId);
-            await props.onSubmit(`/ thread - root ${rootId ?? ''} `);
+            await props.onSubmit(`/thread-root ${rootId ?? ''}`);
           }}
         />
       ) : null}
@@ -778,25 +796,6 @@ export function ChatApp(props: ChatAppProps) {
         />
       ) : null}
 
-      {diffReviewOpen ? (
-        <DiffReviewPanel
-          diffs={selectedToolRunId ? (state.diffGroups[selectedToolRunId] ?? []) : state.diffs}
-          onClose={() => setDiffReviewOpen(false)}
-          onRevertFile={async (path) => {
-            await props.onSubmit(`/ revert - file ${path} `);
-          }}
-          onRevertAll={async () => {
-            if (selectedToolRunId) await props.onSubmit(`/ revert - run ${selectedToolRunId} `);
-            else await props.onSubmit('/revert-all');
-          }}
-          onAccept={() => {
-            if (selectedToolRunId) void props.onSubmit(`/ accept - run ${selectedToolRunId} `);
-            else void props.onSubmit('/accept-diffs');
-            setDiffReviewOpen(false);
-          }}
-        />
-      ) : null}
-
       {siblingsOpen && threadRootId ? (
         <SiblingBranchesPanel
           messages={state.messages}
@@ -804,7 +803,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setSiblingsOpen(false)}
           onSelectChild={async (childId) => {
             setThreadLeafId(childId);
-            await props.onSubmit(`/ thread - leaf ${childId} `);
+            await props.onSubmit(`/thread-leaf ${childId}`);
           }}
         />
       ) : null}
@@ -813,8 +812,8 @@ export function ChatApp(props: ChatAppProps) {
         <TagPanel
           messages={state.messages}
           onClose={() => setTagOpen(false)}
-          onTag={async (id, tag) => props.onSubmit(`/ tag - msg ${id} ${JSON.stringify(tag)} `)}
-          onUntag={async (id, tag) => props.onSubmit(`/ untag - msg ${id} ${JSON.stringify(tag)} `)}
+          onTag={async (id, tag) => props.onSubmit(`/tag-msg ${id} ${JSON.stringify(tag)}`)}
+          onUntag={async (id, tag) => props.onSubmit(`/untag-msg ${id} ${JSON.stringify(tag)}`)}
         />
       ) : null}
 
@@ -823,7 +822,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setDeleteMsgOpen(false)}
           onDelete={async (id) => {
-            await props.onSubmit(`/ delete -msg ${id} `);
+            await props.onSubmit(`/delete-msg ${id}`);
           }}
         />
       ) : null}
@@ -833,7 +832,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setEditAssistantOpen(false)}
           onEdit={async (id, content) => {
-            await props.onSubmit(`/ edit - asst ${id} ${JSON.stringify(content)} `);
+            await props.onSubmit(`/edit-asst ${id} ${JSON.stringify(content)}`);
           }}
         />
       ) : null}
@@ -843,7 +842,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setPruneBranchOpen(false)}
           onPrune={async (leafId) => {
-            await props.onSubmit(`/ prune - branch ${leafId} `);
+            await props.onSubmit(`/prune-branch ${leafId}`);
           }}
         />
       ) : null}
@@ -854,10 +853,9 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setBranchMapOpen(false)}
           onSelectNode={async (id) => {
             setAnchorMessageId(id);
-            // also set as thread root for quick thread view
             setThreadRootId(id);
             setThreadLeafId(null);
-            await props.onSubmit(`/ thread - root ${id} `);
+            await props.onSubmit(`/thread-root ${id}`);
             setBranchMapOpen(false);
           }}
         />
@@ -867,7 +865,7 @@ export function ChatApp(props: ChatAppProps) {
         <ImportSessionPanel
           onClose={() => setImportOpen(false)}
           onImport={async (p) => {
-            await props.onSubmit(`/import ${p} `);
+            await props.onSubmit(`/import ${p}`);
           }}
         />
       ) : null}
@@ -877,7 +875,7 @@ export function ChatApp(props: ChatAppProps) {
       ) : null}
 
       <Box flexDirection="column" flexShrink={0}>
-        {!anyModal && input.startsWith('/') && input.length > 1 && (
+        {!anyModal && !diffReviewOpen && input.startsWith('/') && input.length > 1 && (
           <SlashCommandOverlay query={input} commands={commands} />
         )}
         <Box marginTop={1} marginX={1}>

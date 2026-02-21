@@ -44,7 +44,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const [planMode, setPlanMode] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [queue, setQueue] = useState<string[]>([]);
-  const [pendingPermission, setPendingPermission] = useState<{ calls: any[], resolve: (v: import('../../chat/chat-engine.js').PermissionResult) => void } | null>(null);
+  const [pendingPermission, setPendingPermission] = useState<{ calls: any[], previews?: FileDiff[], resolve: (v: import('../../chat/chat-engine.js').PermissionResult) => void } | null>(null);
 
   const tokenLimit = 128_000;
 
@@ -114,8 +114,8 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
       onSnapshots: (toolRunId: string, snapshots: any[]) => {
         setSnapshotGroups((prev) => ({ ...prev, [toolRunId]: snapshots }));
       },
-      onPermissionRequest: (calls: any[]) => new Promise<import('../../chat/chat-engine.js').PermissionResult>((resolve) => {
-        setPendingPermission({ calls, resolve });
+      onPermissionRequest: (calls: any[], previews?: FileDiff[]) => new Promise<import('../../chat/chat-engine.js').PermissionResult>((resolve) => {
+        setPendingPermission({ calls, previews, resolve });
       }),
     });
 
@@ -191,6 +191,8 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const executePrompt = useCallback(async (text: string) => {
     const engine = await ensureEngine();
     try {
+      setTools([]);
+      setDiffs([]);
       setIsGenerating(true);
       if (text.startsWith('!')) {
         await incUsage('quick-exec');
@@ -262,6 +264,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
       pushToast('error', e?.message ?? 'Command failed');
     } finally {
       setIsGenerating(false);
+      setTools([]);
     }
     await refreshSessions();
   }, [ensureEngine, refreshSessions, branchParentId, pushToast, incUsage]);
@@ -330,6 +333,18 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
         engine.saveSession();
       }
       return;
+    }
+
+    // Auto-track other slash commands in history
+    if (text.startsWith('/') && !text.startsWith('/load-session') && !text.startsWith('/search-all') && !text.startsWith('/mode')) {
+      const session = engine.getCurrentSession();
+      if (session) {
+        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
+        const rc = session.settings.recentCommands || [];
+        session.settings.recentCommands = [text, ...rc.filter(x => x !== text)].slice(0, 20);
+        setRecentCommands(session.settings.recentCommands);
+        engine.saveSession();
+      }
     }
 
     await executePrompt(text);

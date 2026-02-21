@@ -10,25 +10,23 @@ export function ToolPanel(props: { tools: ToolRun[] }) {
   if (recent.length === 0) return null;
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1}>
-      <Text bold color={theme.accent as any}>Tools</Text>
+    <Box flexDirection="column" paddingX={1} marginTop={0}>
       {recent.map((t) => {
-        const icon =
-          t.status === 'running' ? (
-            <Text color={theme.accent as any}>
-              <Spinner type="dots" />
-            </Text>
-          ) : t.status === 'success' ? (
-            <Text color={theme.success as any}>✔</Text>
-          ) : (
-            <Text color={theme.error as any}>✖</Text>
-          );
+        const isRunning = t.status === 'running';
+        const color = t.status === 'success' ? 'green' : (t.status === 'error' ? 'red' : theme.accent as any);
 
         return (
-          <Text key={t.id}>
-            {icon} <Text dimColor>{t.label}</Text>
-            {t.status === 'error' && t.error ? <Text color={theme.error as any}> — {t.error}</Text> : null}
-          </Text>
+          <Box key={t.id} flexDirection="column" marginBottom={isRunning ? 0 : 1}>
+            <Box flexDirection="row">
+              <Text color={color}>{isRunning ? <Spinner type="dots" /> : '● '}</Text>
+              <Text bold>{t.label}</Text>
+            </Box>
+            {!isRunning && (
+              <Box paddingLeft={1} flexDirection="column">
+                <Text dimColor italic>|_ Completed tool {t.id.split('-')[0]}</Text>
+              </Box>
+            )}
+          </Box>
         );
       })}
     </Box>

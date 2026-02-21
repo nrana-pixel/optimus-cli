@@ -23,15 +23,13 @@ export function StatusIndicator(props: {
     if (!props.isRunning) return null;
 
     return (
-        <Box borderStyle="round" borderColor="cyan" paddingX={1} marginY={1}>
-            <Box marginRight={1}>
-                <Spinner type="dots" />
-            </Box>
-            <Text bold color="cyan">
+        <Box paddingX={1} marginY={0} flexDirection="row">
+            <Text bold color="red">● </Text>
+            <Text bold>
                 {props.header || 'Working'}{dots}
             </Text>
             {props.elapsedSecs !== undefined && (
-                <Text dimColor> ({props.elapsedSecs}s)</Text>
+                <Text dimColor> ({props.elapsedSecs}s · esc to interrupt)</Text>
             )}
         </Box>
     );
