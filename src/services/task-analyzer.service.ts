@@ -54,7 +54,7 @@ const SIMPLE_SIGNALS = [
 ];
 
 /** Patterns that add complexity (connectives suggest multiple steps) */
-const CONNECTIVE_PATTERN = /\band\b|\bthen\b|\balso\b|\bwith\b|\bplus\b/gi;
+const CONNECTIVE_PATTERN = /\band\b|\bthen\b|\balso\b|\bplus\b/gi;
 
 // ─── TaskAnalyzerService ──────────────────────────────────────────────────
 

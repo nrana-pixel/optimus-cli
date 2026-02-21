@@ -143,19 +143,22 @@ export default class Code extends Command {
 
       // ── Session setup ─────────────────────────────────────────────────
       let sessionName = `code-${Date.now()}`;
+      const configData = ConfigService.loadConfig();
       if (!flags['new-session']) {
         const session = flags.session
           ? conv.loadSession(flags.session)
           : conv.getLastSession();
         if (session) {
-          conv.loadSession(session.id);
           sessionName = session.name;
+          // Keep metadata in sync with the actual model/provider we will use.
+          session.metadata.provider = configData.apiProvider;
+          session.metadata.model = llm.getModel();
           this.log(`\n📋 Continuing session: ${session.name} (${session.messages.length} messages)`);
         } else {
-          conv.createSession(sessionName, llm.getModel().split('-')[0], llm.getModel());
+          conv.createSession(sessionName, configData.apiProvider, llm.getModel());
         }
       } else {
-        conv.createSession(sessionName, llm.getModel().split('-')[0], llm.getModel());
+        conv.createSession(sessionName, configData.apiProvider, llm.getModel());
       }
 
       // ── Header ────────────────────────────────────────────────────────

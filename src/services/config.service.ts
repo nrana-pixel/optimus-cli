@@ -4,7 +4,7 @@
  */
 
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { LocalModel } from '../types/local-model.js';
@@ -17,12 +17,15 @@ export interface WorkspaceConfig {
   version: string;
   localModels?: LocalModel[];        // Array of configured local models
   defaultLocalModel?: string;        // ID of default local model
+  autonomyMode?: 'interactive' | 'trusted' | 'on-failure'; // Agent autonomy mode
 }
 
 export class ConfigService {
   private static readonly CONFIG_DIR = join(homedir(), '.multi-agent');
   private static readonly CONFIG_FILE = join(this.CONFIG_DIR, 'config.json');
-  private static readonly ALGORITHM = 'aes-256-cbc';
+  // Prefer authenticated encryption.
+  private static readonly ALGORITHM_GCM = 'aes-256-gcm';
+  private static readonly ALGORITHM_LEGACY = 'aes-256-cbc';
   private static readonly SALT = 'multi-agent-cli'; // In production, use a secure salt
 
   /**
@@ -47,30 +50,48 @@ export class ConfigService {
   }
 
   /**
-   * Encrypt API key using AES-256-CBC
+   * Encrypt API key using AES-256-GCM (authenticated encryption).
+   * Format: gcm:<ivHex>:<tagHex>:<cipherHex>
    */
   static encryptApiKey(apiKey: string): string {
     try {
-      const iv = randomBytes(16);
+      const iv = randomBytes(12); // recommended length for GCM
       const key = scryptSync(this.SALT, 'salt', 32);
-      const cipher = createCipheriv(this.ALGORITHM, key, iv);
+      const cipher = createCipheriv(this.ALGORITHM_GCM, key, iv);
 
       let encrypted = cipher.update(apiKey, 'utf8', 'hex');
       encrypted += cipher.final('hex');
+      const tag = cipher.getAuthTag();
 
-      // Combine IV and encrypted data
-      return iv.toString('hex') + ':' + encrypted;
+      return `gcm:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted}`;
     } catch (error) {
       throw new Error(`Failed to encrypt API key: ${error}`);
     }
   }
 
   /**
-   * Decrypt API key
+   * Decrypt API key.
+   * Supports both new AES-256-GCM format and legacy AES-256-CBC format.
    */
   static decryptApiKey(encryptedKey: string): string {
     try {
       const parts = encryptedKey.split(':');
+
+      // New format: gcm:<ivHex>:<tagHex>:<cipherHex>
+      if (parts[0] === 'gcm') {
+        if (parts.length !== 4) throw new Error('Invalid GCM encrypted key format');
+        const iv = Buffer.from(parts[1], 'hex');
+        const tag = Buffer.from(parts[2], 'hex');
+        const encrypted = parts[3];
+        const key = scryptSync(this.SALT, 'salt', 32);
+        const decipher = createDecipheriv(this.ALGORITHM_GCM, key, iv);
+        decipher.setAuthTag(tag);
+        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return decrypted;
+      }
+
+      // Legacy format: <ivHex>:<cipherHex>
       if (parts.length !== 2) {
         throw new Error('Invalid encrypted key format');
       }
@@ -78,7 +99,7 @@ export class ConfigService {
       const iv = Buffer.from(parts[0], 'hex');
       const encrypted = parts[1];
       const key = scryptSync(this.SALT, 'salt', 32);
-      const decipher = createDecipheriv(this.ALGORITHM, key, iv);
+      const decipher = createDecipheriv(this.ALGORITHM_LEGACY, key, iv);
 
       let decrypted = decipher.update(encrypted, 'hex', 'utf8');
       decrypted += decipher.final('utf8');
@@ -169,8 +190,12 @@ export class ConfigService {
    */
   static deleteConfig(): void {
     if (existsSync(this.CONFIG_FILE)) {
-      writeFileSync(this.CONFIG_FILE, '');
-      // In production, securely wipe the file
+      try {
+        unlinkSync(this.CONFIG_FILE);
+      } catch {
+        // Fallback: overwrite with empty JSON so loadConfig doesn't crash
+        writeFileSync(this.CONFIG_FILE, '{}');
+      }
     }
   }
 
@@ -204,8 +229,8 @@ export class ConfigService {
     }
 
     if (provider === 'openai') {
-      // OpenAI keys typically start with 'sk-'
-      return apiKey.startsWith('sk-');
+      // OpenAI keys start with 'sk-' (legacy) or 'sk-proj-' (project keys)
+      return apiKey.startsWith('sk-') || apiKey.startsWith('sk-proj-');
     } else if (provider === 'anthropic') {
       // Anthropic keys typically start with 'sk-ant-'
       return apiKey.startsWith('sk-ant-');

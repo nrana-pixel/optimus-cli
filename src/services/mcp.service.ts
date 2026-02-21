@@ -138,7 +138,14 @@ export class MCPService {
       { capabilities: {} }
     );
 
-    await client.connect(transport);
+    // Connect with a timeout to prevent hanging on unresponsive servers
+    const CONNECT_TIMEOUT_MS = 15_000;
+    await Promise.race([
+      client.connect(transport),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`MCP server '${config.name}' connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s`)), CONNECT_TIMEOUT_MS)
+      ),
+    ]);
 
     // Discover tools
     const result = await client.listTools();
@@ -258,50 +265,32 @@ export class MCPService {
   // ─── LLM system prompt integration ──────────────────────────────────────
 
   /**
+   * Return native OpenAI-compatible tool definitions for MCP servers.
+   */
+  getNativeTools(): any[] {
+    return this.tools.map(tool => {
+      // Create a clean JSON schema for parameters
+      let parameters = tool.inputSchema || { type: 'object', properties: {} };
+      if (!parameters.type) parameters.type = 'object';
+      
+      return {
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: (tool.description || '') + ` [Server: ${tool.serverName}]`,
+          parameters
+        }
+      };
+    });
+  }
+
+  /**
    * Generate a system prompt section listing all MCP tools.
    * This is appended to the main tools system prompt.
    */
   mcpToolsSection(): string {
     if (this.tools.length === 0) return '';
-
-    const lines: string[] = [
-      '',
-      '## MCP Tools (external capabilities)',
-      '',
-      'These tools are provided by connected MCP servers. Call them the same way:',
-      '',
-      '| Tool | Server | Description |',
-      '|------|--------|-------------|',
-    ];
-
-    for (const tool of this.tools) {
-      // Build a brief args hint from the schema
-      const props = tool.inputSchema?.properties;
-      const argHint = props
-        ? Object.keys(props).map(k => `${k}: ${props[k]?.type || 'any'}`).join(', ')
-        : '(no args)';
-
-      lines.push(`| ${tool.name} | ${tool.serverName} | ${tool.description.slice(0, 80)} |`);
-    }
-
-    lines.push('');
-    lines.push('### MCP tool arguments');
-    lines.push('');
-    for (const tool of this.tools) {
-      const props = tool.inputSchema?.properties;
-      if (props) {
-        const required = tool.inputSchema?.required || [];
-        const argDesc = Object.entries(props).map(([k, v]: [string, any]) => {
-          const req = required.includes(k) ? ' (required)' : '';
-          return `  - ${k}: ${v.type || 'any'}${req} — ${v.description || ''}`;
-        }).join('\n');
-        lines.push(`**${tool.name}**:`);
-        lines.push(argDesc);
-        lines.push('');
-      }
-    }
-
-    return lines.join('\n');
+    return '\n## MCP Tools Available:\n' + this.tools.map(t => `- ${t.name} (from ${t.serverName}): ${t.description}`).join('\n') + '\nCall these using native tool calls.\n';
   }
 
   // ─── Pre-configured popular servers ────────────────────────────────────

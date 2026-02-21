@@ -3,14 +3,31 @@
  * Manages conversation history and session persistence
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'crypto';
+
+export type MessageReaction = 'up' | 'down';
 
 export interface Message {
-  role: 'user' | 'assistant';
-  content: string;
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string | any[];
   timestamp: string;
+
+  // Enhanced UI metadata (optional for backward compatibility)
+  reactions?: MessageReaction[];
+  pinned?: boolean;
+  editedAt?: string;
+  parentMessageId?: string; // enables simple branching
+  tags?: string[];
+
+  // Analytics metadata (optional)
+  provider?: string;
+  model?: string;
+  tokensDelta?: number;
+  costDelta?: number;
 }
 
 export interface ConversationSession {
@@ -25,7 +42,21 @@ export interface ConversationSession {
     totalTokens: number;
     totalCost: number;
   };
+
+  // Persisted UI settings
+  settings?: {
+    theme?: 'dark' | 'light' | 'high-contrast';
+    compactMode?: boolean;
+    showLineNumbers?: boolean;
+    // Ink UI persisted state
+    recentCommands?: string[];
+    threadRootId?: string | null;
+    threadLeafId?: string | null;
+    usage?: Record<string, number>;
+    provider?: string;
+  };
 }
+
 
 export class ConversationService {
   private static readonly SESSIONS_DIR = join(homedir(), '.multi-agent', 'sessions');
@@ -33,6 +64,23 @@ export class ConversationService {
 
   constructor() {
     this.ensureSessionsDirectory();
+  }
+
+  /** Backward-compatible migration for older session JSON formats */
+  private _migrateSessionInPlace(session: ConversationSession) {
+    // Ensure settings exists
+    session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
+    session.settings.recentCommands ??= [];
+    if (session.settings.threadRootId === undefined) session.settings.threadRootId = null;
+    if (session.settings.threadLeafId === undefined) session.settings.threadLeafId = null;
+    (session.settings as any).usage ??= {};
+    (session.settings as any).provider ??= 'unknown';
+
+    // Ensure message IDs
+    for (const m of session.messages as any[]) {
+      if (!m.id) m.id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      if (!m.timestamp) m.timestamp = new Date().toISOString();
+    }
   }
 
   /**
@@ -79,7 +127,8 @@ export class ConversationService {
       }
 
       const content = readFileSync(filePath, 'utf-8');
-      this.currentSession = JSON.parse(content);
+      this.currentSession = JSON.parse(content) as ConversationSession;
+      this._migrateSessionInPlace(this.currentSession);
       return this.currentSession;
     } catch (error) {
       return null;
@@ -91,7 +140,7 @@ export class ConversationService {
    */
   getLastSession(): ConversationSession | null {
     try {
-      const files = require('fs').readdirSync(ConversationService.SESSIONS_DIR);
+      const files = readdirSync(ConversationService.SESSIONS_DIR);
       if (files.length === 0) {
         return null;
       }
@@ -100,7 +149,7 @@ export class ConversationService {
       const sessions = files
         .map((file: string) => {
           const filePath = join(ConversationService.SESSIONS_DIR, file);
-          const stats = require('fs').statSync(filePath);
+          const stats = statSync(filePath);
           return { file, time: stats.mtimeMs };
         })
         .sort((a: any, b: any) => b.time - a.time);
@@ -119,21 +168,37 @@ export class ConversationService {
   /**
    * Add a message to the current session
    */
-  addMessage(role: 'user' | 'assistant', content: string): Message {
+  addMessage(role: 'user' | 'assistant' | 'system', content: string | any[], opts?: Partial<Omit<Message, 'role' | 'content' | 'timestamp'>>): Message {
     if (!this.currentSession) {
       throw new Error('No active session');
     }
 
     const message: Message = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       role,
       content,
       timestamp: new Date().toISOString(),
+      provider: this.currentSession.metadata.provider,
+      model: this.currentSession.metadata.model,
+      ...opts,
     };
 
     this.currentSession.messages.push(message);
     this.currentSession.updatedAt = new Date().toISOString();
 
     return message;
+  }
+
+  /**
+   * Update an existing message
+   */
+  updateMessage(id: string, updates: Partial<Omit<Message, 'id'>>): boolean {
+    if (!this.currentSession) return false;
+    const idx = this.currentSession.messages.findIndex(m => m.id === id);
+    if (idx === -1) return false;
+    this.currentSession.messages[idx] = { ...this.currentSession.messages[idx], ...updates };
+    this.currentSession.updatedAt = new Date().toISOString();
+    return true;
   }
 
   /**
@@ -158,14 +223,19 @@ export class ConversationService {
     }
 
     return this.currentSession.messages
-      .map((msg) => `${msg.role.toUpperCase()}: ${msg.content}`)
+      .map((msg) => {
+        const text = Array.isArray(msg.content) 
+          ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n') 
+          : msg.content;
+        return `${msg.role.toUpperCase()}: ${text}`;
+      })
       .join('\n\n');
   }
 
   /**
    * Get messages for LLM context (last N messages)
    */
-  getContextMessages(limit: number = 10): Array<{ role: string; content: string }> {
+  getContextMessages(limit: number = 10): Array<{ role: string; content: string | any[] }> {
     if (!this.currentSession) {
       return [];
     }
@@ -201,15 +271,20 @@ export class ConversationService {
    */
   listSessions(): ConversationSession[] {
     try {
-      const files = require('fs').readdirSync(ConversationService.SESSIONS_DIR);
+      const files = readdirSync(ConversationService.SESSIONS_DIR);
       const sessions: ConversationSession[] = [];
 
       for (const file of files) {
         if (file.endsWith('.json')) {
-          const sessionId = file.replace('.json', '');
-          const session = this.loadSession(sessionId);
-          if (session) {
-            sessions.push(session);
+          try {
+            const filePath = join(ConversationService.SESSIONS_DIR, file);
+            const content = readFileSync(filePath, 'utf-8');
+            const session = JSON.parse(content) as ConversationSession;
+            if (session) {
+              sessions.push(session);
+            }
+          } catch {
+            // Skip corrupt session files
           }
         }
       }
@@ -228,7 +303,7 @@ export class ConversationService {
     try {
       const filePath = join(ConversationService.SESSIONS_DIR, `${sessionId}.json`);
       if (existsSync(filePath)) {
-        require('fs').unlinkSync(filePath);
+        unlinkSync(filePath);
         return true;
       }
       return false;
@@ -248,7 +323,12 @@ export class ConversationService {
    * Generate a unique session ID
    */
   private generateSessionId(): string {
-    return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    // Prefer UUIDs to avoid collisions and deprecated string APIs.
+    try {
+      return `session-${randomUUID()}`;
+    } catch {
+      return `session-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    }
   }
 
   /**

@@ -139,9 +139,10 @@ export default class Analyze extends Command {
     } catch (err: any) {
       stop();
       this.error(err.message);
-    } finally {
-      stop();
+      return; // oclif's this.error() throws, but this makes the intent clear
     }
+
+    stop();
 
     // ── Header ──────────────────────────────────────────────────────────────
     const bar = '─'.repeat(54);

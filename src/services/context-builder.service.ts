@@ -330,19 +330,31 @@ export class ContextBuilderService {
         : `dependency`;
 
       lines.push(`#### ${s.file.path}`);
-      lines.push(`*${s.file.language} · ${s.file.lines} lines · ${badge}*`);
-
-      if (s.file.imports.length) {
-        lines.push(`*Imports: ${s.file.imports.join(', ')}*`);
+      
+      const isLowRelevance = s.score < 20 && !s.reasons[0]?.includes('explicitly mentioned');
+      
+      if (isLowRelevance) {
+        lines.push(`*${s.file.language} · ${s.file.lines} lines · ${badge} (SIGNATURES ONLY)*`);
+        if (s.file.imports.length) {
+          lines.push(`*Imports: ${s.file.imports.join(', ')}*`);
+        }
+        if (s.file.exports.length) {
+          lines.push(`*Exports: ${s.file.exports.join(', ')}*`);
+        }
+        lines.push('*Full content omitted to save context space. Use read_file if you need to see the implementation details.*');
+      } else {
+        lines.push(`*${s.file.language} · ${s.file.lines} lines · ${badge}*`);
+        if (s.file.imports.length) {
+          lines.push(`*Imports: ${s.file.imports.join(', ')}*`);
+        }
+        if (s.file.exports.length) {
+          lines.push(`*Exports: ${s.file.exports.join(', ')}*`);
+        }
+        lines.push('');
+        lines.push('```' + ext);
+        lines.push(s.content || '(empty or unreadable)');
+        lines.push('```');
       }
-      if (s.file.exports.length) {
-        lines.push(`*Exports: ${s.file.exports.join(', ')}*`);
-      }
-
-      lines.push('');
-      lines.push('```' + ext);
-      lines.push(s.content || '(empty or unreadable)');
-      lines.push('```');
       lines.push('');
     }
 

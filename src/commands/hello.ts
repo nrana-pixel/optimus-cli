@@ -18,6 +18,6 @@ export default class Hello extends Command {
 
   async run(): Promise<void> {
     const { flags } = await this.parse(Hello);
-    this.log(`Hello ${flags.name}!`);
+    this.log(`Hello again ${flags.name}!`);
   }
 }

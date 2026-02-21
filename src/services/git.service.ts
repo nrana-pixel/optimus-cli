@@ -5,7 +5,7 @@
  * Uses simple-git under the hood.
  */
 
-import simpleGit, { SimpleGit, SimpleGitOptions } from 'simple-git';
+import { simpleGit, type SimpleGit, type SimpleGitOptions } from 'simple-git';
 import { existsSync } from 'fs';
 import { join } from 'path';
 
@@ -263,7 +263,7 @@ export class GitService {
         shortHash: e.hash.slice(0, 8),
         date:      e.date,
         message:   e.message,
-        author:    (e as any).author_name ?? '',
+        author:    (e as any).author ?? '',
         refs:      (e as any).refs ?? '',
       }));
     } catch {

@@ -2,7 +2,6 @@ import { Command } from '@oclif/core';
 import prompts from 'prompts';
 import { ConfigService } from '../services/config.service.js';
 import { Logger } from '../utils/logger.js';
-
 export default class Init extends Command {
   static override description = 'Initialize a new multi-agent workspace';
 
@@ -109,10 +108,10 @@ export default class Init extends Command {
       this.log('📅 Created at: ' + config.createdAt);
 
       this.log('\n📚 Next steps:');
-      this.log('  1. Create your first agent: cli-project agent create');
-      this.log('  2. Define tasks: cli-project task create');
-      this.log('  3. Run agents: cli-project agent run');
-      this.log('  4. View logs: cli-project logs\n');
+      this.log('  1. Start chatting: optimus chat');
+      this.log('  2. Run a coding task: optimus code "your task"');
+      this.log('  3. Analyze your project: optimus analyze');
+      this.log('  4. Manage config: optimus config\n');
     } catch (error) {
       Logger.error('Initialization failed: ' + (error instanceof Error ? error.message : String(error)));
       process.exit(1);

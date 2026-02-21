@@ -17,8 +17,7 @@
  *     → 8. Return AgentResult
  */
 
-import { writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { resolve, relative, isAbsolute, normalize } from 'path';
 
 import { LLMServiceLiteLLM }              from './llm-litellm.service.js';
 import { AnalyzerService }                from './analyzer.service.js';
@@ -73,7 +72,7 @@ export interface AgentResult {
 export class AgentOrchestrator {
   private llm:           LLMServiceLiteLLM;
   private analyzer:      AnalyzerService;
-  private ctxBuilder:    ContextBuilderService;
+  private ctxBuilder:    ContextBuilderService | null;
   private taskAnalyzer:  TaskAnalyzerService;
   private git:           GitService;
   private tools:         ToolsService;
@@ -81,7 +80,7 @@ export class AgentOrchestrator {
   constructor(llm: LLMServiceLiteLLM, workingDir: string) {
     this.llm          = llm;
     this.analyzer     = new AnalyzerService();
-    this.ctxBuilder   = new ContextBuilderService({} as any); // re-set after analysis
+    this.ctxBuilder   = null;
     this.taskAnalyzer = new TaskAnalyzerService();
     this.git          = new GitService(workingDir);
     this.tools        = new ToolsService(workingDir);
@@ -146,7 +145,7 @@ export class AgentOrchestrator {
     } else {
       // ── 4a. Simple/Medium: single ReAct loop ───────────────────────
       const step = await this.executeWithTools(task, contextString, null, [], opt, emit, maxToolLoops);
-      this.applyStep(step, result, outputDir, null, emit);
+      await this.applyStep(step, result, outputDir, null, emit);
     }
 
     result.durationMs = Date.now() - startTime;
@@ -197,7 +196,7 @@ export class AgentOrchestrator {
         subtask.description, subtaskContext, subtask, previousResults, opt, emit, maxToolLoops,
       );
 
-      this.applyStep(step, result, resolve(opt.outputDir), subtask, emit);
+      await this.applyStep(step, result, resolve(opt.outputDir), subtask, emit);
 
       previousResults.push({
         subtask,
@@ -248,11 +247,11 @@ export class AgentOrchestrator {
       loops++;
       emit({ type: 'status', message: loops === 1 ? 'Generating…' : `Tool loop ${loops}/${maxLoops}…` });
 
-      const res = await this.llm.completeWithHistory(messages);
+      const res = await this.llm.completeWithHistory(messages, undefined, ToolsService.getNativeTools(false));
       step.tokens += res.tokensUsed.total;
       step.cost   += res.cost.total;
 
-      const toolCalls = ToolsService.parseToolCalls(res.content);
+      const toolCalls = res.toolCalls || [];
 
       if (!toolCalls.length) {
         // Final answer — no more tool calls
@@ -262,7 +261,7 @@ export class AgentOrchestrator {
       }
 
       // Execute each tool call
-      messages.push({ role: 'assistant', content: res.content });
+      messages.push({ role: 'assistant', content: res.content || 'Executing tools...' });
       const resultParts: string[] = [];
 
       for (const call of toolCalls) {
@@ -270,7 +269,7 @@ export class AgentOrchestrator {
           type: 'tool_call',
           message: `→ ${call.name}(${JSON.stringify(call.args)})`,
         });
-        const toolResult = await this.tools.execute(call);
+        const toolResult = await this.tools.execute(call as any);
         step.toolCalls.push(toolResult);
 
         const formatted = ToolsService.formatToolResult(toolResult);
@@ -290,20 +289,20 @@ export class AgentOrchestrator {
     }
 
     // Parse code blocks from the final response
-    step.files = this.parseAndWriteBlocks(step.response, resolve(opt.outputDir), emit);
+    step.files = await this.parseAndWriteBlocks(step.response, resolve(opt.outputDir), emit);
 
     return step;
   }
 
   // ─── Apply step results (write files + git commit) ──────────────────────
 
-  private applyStep(
+  private async applyStep(
     step:      StepResult,
     result:    AgentResult,
     outputDir: string,
     subtask:   SubTask | null,
     emit:      (ev: AgentEvent) => void,
-  ): void {
+  ): Promise<void> {
 
     result.steps.push(step);
     result.totalTokens += step.tokens;
@@ -312,51 +311,76 @@ export class AgentOrchestrator {
 
     // Git commit for this step
     if (step.files.length) {
-      this.commitStep(step.files, subtask?.title ?? 'AI changes', result, emit);
+      await this.commitStep(step.files, subtask?.title ?? 'AI changes', result, emit);
     }
   }
 
-  private commitStep(
+  private async commitStep(
     files:   string[],
     title:   string,
     result:  AgentResult,
     emit:    (ev: AgentEvent) => void,
-  ): void {
-    this.git.isGitRepo().then(async isRepo => {
-      if (!isRepo) return;
-      try {
-        await this.git.stageFiles(files);
-        const msg    = `feat: ${title}`;
-        const commit = await this.git.commit(msg);
-        result.commits.push(commit.hash);
-        emit({ type: 'git_commit', message: `${commit.hash} ${msg}` });
-      } catch { /* non-fatal */ }
-    });
+  ): Promise<void> {
+    const isRepo = await this.git.isGitRepo();
+    if (!isRepo) return;
+    try {
+      await this.git.stageFiles(files);
+      const msg    = `feat: ${title}`;
+      const commit = await this.git.commit(msg);
+      result.commits.push(commit.hash);
+      emit({ type: 'git_commit', message: `${commit.hash} ${msg}` });
+    } catch { /* non-fatal */ }
   }
 
   // ─── Code block parser + file writer ────────────────────────────────────
 
-  private parseAndWriteBlocks(
+  private async parseAndWriteBlocks(
     response:  string,
     outputDir: string,
     emit:      (ev: AgentEvent) => void,
-  ): string[] {
+  ): Promise<string[]> {
 
     const written: string[] = [];
     const BLOCK_RE = /```(?:[\w-]+)?:([^\n]+)\n([\s\S]*?)```/g;
     let m: RegExpExecArray | null;
+
+    const isSafeRelPath = (p: string): boolean => {
+      if (!p) return false;
+      const norm = normalize(p).replace(/\\/g, '/');
+      if (isAbsolute(norm)) return false;
+      if (/^[A-Za-z]:\//.test(norm)) return false;
+      if (norm === '..' || norm.startsWith('../') || norm.includes('/../')) return false;
+      return true;
+    };
 
     while ((m = BLOCK_RE.exec(response)) !== null) {
       const filename = m[1].trim();
       const content  = m[2];
       if (!filename || !content.trim()) continue;
 
-      const fp = join(outputDir, filename);
-      const fd = dirname(fp);
+      if (!isSafeRelPath(filename)) {
+        emit({ type: 'error', message: `Blocked unsafe write path: ${filename}` });
+        continue;
+      }
 
-      if (!existsSync(fd)) mkdirSync(fd, { recursive: true });
-      writeFileSync(fp, content, 'utf-8');
-      written.push(fp);
+      const fp = resolve(outputDir, filename);
+      const relToOut = relative(outputDir, fp).replace(/\\/g, '/');
+      if (relToOut.startsWith('..')) {
+        emit({ type: 'error', message: `Blocked write outside outputDir: ${filename}` });
+        continue;
+      }
+
+      const toolResult = await this.tools.execute({
+        name: 'write_file',
+        args: { path: relToOut, content },
+      });
+
+      if (toolResult.error) {
+        emit({ type: 'error', message: `Failed to write ${filename}: ${toolResult.error}` });
+        continue;
+      }
+
+      written.push(relToOut);
       emit({ type: 'file_written', message: `✅ ${filename}`, data: { path: fp } });
     }
 
@@ -366,28 +390,10 @@ export class AgentOrchestrator {
   // ─── System prompt builder ───────────────────────────────────────────────
 
   private buildSystemPrompt(contextString: string): string {
-    return `You are an elite coding agent — like Claude Code or GitHub Copilot Workspace.
-Your job is to implement the requested task accurately and completely in the existing codebase.
+    const localInstructions = ToolsService.readLocalInstructions(resolve('.'), resolve('.'));
+    const projectContext = ToolsService.readProjectContext(resolve('.'));
 
-${ToolsService.toolsSystemSection()}
-
-## Workflow
-1. Use tools to READ and UNDERSTAND relevant existing code BEFORE writing
-2. Once you understand the pattern, write complete, production-ready code
-3. Output files using this format for EACH file:
-   \`\`\`language:path/to/file.ext
-   // full file content here
-   \`\`\`
-4. Return the full file content — not diffs, not partial snippets
-5. Match the existing code style, imports, and naming conventions
-
-## Quality requirements
-- Complete, runnable code only (never TODO or placeholder)
-- Proper error handling
-- Match the project's existing patterns exactly
-- Import from the same paths used by existing files
-
-${contextString}`;
+    return ToolsService.toolsSystemSection(projectContext, false, localInstructions) + `\n\n${contextString}`;
   }
 
   // ─── Static report formatter ─────────────────────────────────────────────
