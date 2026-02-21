@@ -2,7 +2,6 @@ import { Command } from '@oclif/core';
 import prompts from 'prompts';
 import { ConfigService } from '../services/config.service.js';
 import { Logger } from '../utils/logger.js';
-
 export default class Init extends Command {
   static override description = 'Initialize a new multi-agent workspace';
 

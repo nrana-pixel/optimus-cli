@@ -25,6 +25,7 @@ import { BranchMapPanel } from './panels/BranchMapPanel.js';
 import { ImportSessionPanel } from './panels/ImportSessionPanel.js';
 import { HelpOverlayPanel } from './panels/HelpOverlayPanel.js';
 import { PromptInput } from './PromptInput.js';
+import { HeaderBar } from './HeaderBar.js';
 import { StatusBar } from './StatusBar.js';
 import { ToolPanel } from './ToolPanel.js';
 import { DiffPanel } from './DiffPanel.js';
@@ -107,7 +108,8 @@ export function ChatApp(props: ChatAppProps) {
     };
   }, [stdout]);
 
-  const usableHeight = Math.max(10, height - 15);
+  // Reserve space for header + prompt/status area. Keep this tight to avoid huge blank regions.
+  const usableHeight = Math.max(10, height - 4);
   const columns = Math.max(20, Number((process.stdout as any)?.columns) || 80);
   const [page, setPage] = useState(0); // deprecated, kept for compatibility but unused
   const [anchorMessageId, setAnchorMessageId] = useState<string | null>(null);
@@ -189,6 +191,17 @@ export function ChatApp(props: ChatAppProps) {
 
     // panels
     if (key.ctrl && ch === 'f') setSearchOpen(true);
+
+    // Scrolling (Qodo-like): Up/Down when no overlay is open
+    if (!anyModal && (key.upArrow || key.downArrow || (key as any).wheelUp || (key as any).wheelDown)) {
+      const delta = key.upArrow || (key as any).wheelUp ? 1 : -1;
+      setScrollOffset((o) => {
+        // scrollOffset: 0 = bottom/newest, increase to move up/older
+        const max = Math.max(0, viewMessages.length - 1);
+        return Math.min(Math.max(o + delta, 0), max);
+      });
+      return;
+    }
 
     // return to previous view after jump-to
     if (key.ctrl && ch === 'z') {
@@ -320,7 +333,16 @@ export function ChatApp(props: ChatAppProps) {
   ];
 
   return (
-    <Box flexDirection="column" height={height} overflow="hidden">
+    <Box flexDirection="column" overflow="hidden">
+      <HeaderBar
+        model={props.model}
+        sessionName={props.sessionName}
+        provider={state.provider}
+        toolsEnabled={state.toolsEnabled}
+        planMode={state.planMode}
+        themeName={state.themeName}
+        columns={columns}
+      />
 
       {anchorMessageId ? (
         <Box borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1} display={anyModal ? 'none' : 'flex'}>
@@ -330,7 +352,21 @@ export function ChatApp(props: ChatAppProps) {
         </Box>
       ) : null}
 
-      <Box flexDirection="column" display={anyModal ? 'none' : 'flex'} flexGrow={1} justifyContent="flex-end">
+      <Box flexDirection="column" display={anyModal ? 'none' : 'flex'}>
+        {viewMessages.length === 0 ? (
+          <Box marginX={1} marginTop={1} flexShrink={0}>
+            <Box borderStyle="round" borderColor={theme.accent as any} paddingX={1}>
+              <Text dimColor>Quick actions: </Text>
+              <Text color={theme.accent as any}>[Summarize repo]</Text>
+              <Text> </Text>
+              <Text color={theme.accent as any}>[Find bugs]</Text>
+              <Text> </Text>
+              <Text color={theme.accent as any}>[Add tests]</Text>
+              <Text> </Text>
+              <Text dimColor>[Type / for commands]</Text>
+            </Box>
+          </Box>
+        ) : null}
         {(() => {
           if (anchorMessageId) {
             const idx = viewMessages.findIndex((m) => m.id === anchorMessageId);
@@ -366,11 +402,6 @@ export function ChatApp(props: ChatAppProps) {
               const start = upIdx + 1;
               return (
                 <>
-                  {start === 0 && (
-                    <Box paddingX={1} paddingBottom={1} flexShrink={0}>
-                      <Text dimColor>Optimus · {props.model} · {props.sessionName}</Text>
-                    </Box>
-                  )}
                   <MessageList
                     messages={slice}
                     compactMode={settings.compactMode}
@@ -412,11 +443,6 @@ export function ChatApp(props: ChatAppProps) {
 
           return (
             <>
-              {start === 0 && (
-                <Box paddingX={1} paddingBottom={1} flexShrink={0}>
-                  <Text dimColor>Optimus · {props.model} · {props.sessionName}</Text>
-                </Box>
-              )}
               <MessageList
                 messages={slice}
                 compactMode={settings.compactMode}
@@ -779,7 +805,7 @@ export function ChatApp(props: ChatAppProps) {
       ) : null}
 
       <Box flexDirection="column" flexShrink={0}>
-        <Box marginTop={1}>
+        <Box marginTop={1} marginX={1}>
           <PromptInput
             value={input}
             onChange={(v) => {
@@ -793,11 +819,9 @@ export function ChatApp(props: ChatAppProps) {
             disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen}
           />
         </Box>
-
         <Toasts toasts={state.toasts} />
-
         {state.isGenerating && <StatusBar hint="Generating..." isGenerating={true} />}
-        <Text dimColor>Tip: Press “?” for shortcuts. Press “/” for palette. Ctrl+R regen. Ctrl+U/Ctrl+D react.</Text>
+        <Text dimColor>“/” commands • “?” shortcuts • ↑↓ scroll</Text>
       </Box>
     </Box>
   );
