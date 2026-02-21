@@ -24,6 +24,7 @@ import { PruneBranchPanel } from './panels/PruneBranchPanel.js';
 import { BranchMapPanel } from './panels/BranchMapPanel.js';
 import { ImportSessionPanel } from './panels/ImportSessionPanel.js';
 import { HelpOverlayPanel } from './panels/HelpOverlayPanel.js';
+import { PermissionPanel } from './panels/PermissionPanel.js';
 import { PromptInput } from './PromptInput.js';
 import { HeaderBar } from './HeaderBar.js';
 import { StatusBar } from './StatusBar.js';
@@ -44,6 +45,10 @@ export interface ChatAppProps {
   onRegenerateLast: () => Promise<void>;
   onTogglePinLast: () => Promise<void>;
   onReactLast: (reaction: 'up' | 'down') => Promise<void>;
+  onApproveTools: () => void;
+  onDenyTools: () => void;
+  onAlwaysApprove: () => void;
+  onFeedbackTools: (text: string) => void;
 
   getRuntimeState: () => {
     tokens: number;
@@ -65,11 +70,17 @@ export interface ChatAppProps {
     usage: Record<string, number>;
     provider: string;
     isGenerating: boolean;
+    pendingPermission: { calls: any[], resolve: (v: import('../chat/chat-engine.js').PermissionResult) => void } | null;
   };
 }
+function getTextFromContent(content: UIMessage['content']): string {
+  return content.map(block => block.type === 'text' ? block.text : '').join('\n');
+}
+
 function getMessageHeight(m: UIMessage, columns: number, compactMode: boolean): number {
   let lines = 1; // header
-  const textLines = (m.content || '').split('\n');
+  const text = getTextFromContent(m.content);
+  const textLines = text.split('\n');
   for (const line of textLines) {
     if (line.length === 0) lines += 1;
     else lines += Math.ceil(line.length / columns);
@@ -96,22 +107,6 @@ export function ChatApp(props: ChatAppProps) {
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
   const [searchAllOpen, setSearchAllOpen] = useState(false);
   const [scrollOffset, setScrollOffset] = useState(0); // 0 = bottom/newest
-
-  const { stdout } = useStdout();
-  const [height, setHeight] = useState(stdout.rows);
-
-  useEffect(() => {
-    const onResize = () => setHeight(stdout.rows);
-    stdout.on('resize', onResize);
-    return () => {
-      stdout.off('resize', onResize);
-    };
-  }, [stdout]);
-
-  // Reserve space for header + prompt/status area. Keep this tight to avoid huge blank regions.
-  const usableHeight = Math.max(10, height - 4);
-  const columns = Math.max(20, Number((process.stdout as any)?.columns) || 80);
-  const [page, setPage] = useState(0); // deprecated, kept for compatibility but unused
   const [anchorMessageId, setAnchorMessageId] = useState<string | null>(null);
   const [returnState, setReturnState] = useState<null | { scrollOffset: number; threadRootId: string | null; threadLeafId: string | null }>(null);
   const [branchOpen, setBranchOpen] = useState(false);
@@ -130,13 +125,32 @@ export function ChatApp(props: ChatAppProps) {
   const [importOpen, setImportOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
 
+  const { stdout } = useStdout();
+  const [height, setHeight] = useState(stdout.rows);
+
+  const state = props.getRuntimeState();
+
   const [settings, setSettings] = useState<UISettings>({
     theme: 'dark',
     compactMode: false,
     showLineNumbers: false,
   });
 
-  const state = props.getRuntimeState();
+  useEffect(() => {
+    const onResize = () => setHeight(stdout.rows);
+    stdout.on('resize', onResize);
+    return () => {
+      stdout.off('resize', onResize);
+    };
+  }, [stdout]);
+
+  // Reserve space for header + prompt/status area. Keep this tight to avoid huge blank regions.
+  let usableHeight = Math.max(10, height - 4);
+  if (state.pendingPermission) {
+    const panelH = 7 + (state.pendingPermission.calls?.length || 1);
+    usableHeight = Math.max(5, usableHeight - panelH);
+  }
+  const columns = Math.max(20, Number((process.stdout as any)?.columns) || 80);
 
   useEffect(() => {
     if (!threadRootId && state.savedThreadRootId) {
@@ -167,9 +181,14 @@ export function ChatApp(props: ChatAppProps) {
     setScrollOffset((o) => Math.min(Math.max(o, 0), Math.max(0, viewMessages.length - 1)));
   }, [viewMessages.length]);
 
-  const hint = useMemo(() => {
-    return 'Shortcuts: Press "Esc" to close overlays, Ctrl+C to exit.';
-  }, []);
+  const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || toolRunsOpen || diffReviewOpen || siblingsOpen || tagOpen || editAssistantOpen || deleteMsgOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen;
+
+  const dynamicHint = useMemo(() => {
+    if (state.pendingPermission) return 'Y/N/A to approve tools, or type feedback.';
+    if (anyModal) return 'Esc to close overlay, ↑/↓ to navigate, Enter to select.';
+    if (state.isGenerating) return 'Generating...';
+    return 'Ctrl+F Search • / Commands • ? Help • ↑↓ Scroll • Ctrl+C Exit';
+  }, [state.pendingPermission, anyModal, state.isGenerating]);
 
   const submit = useCallback(async () => {
     const v = input.trim();
@@ -179,7 +198,6 @@ export function ChatApp(props: ChatAppProps) {
     await props.onSubmit(v);
   }, [input, props]);
 
-  const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || toolRunsOpen || diffReviewOpen || siblingsOpen || tagOpen || editAssistantOpen || deleteMsgOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen;
 
   useInput(async (ch, key) => {
     if (key.ctrl && ch === 'c') exit();
@@ -407,6 +425,15 @@ export function ChatApp(props: ChatAppProps) {
                     compactMode={settings.compactMode}
                     anchorMessageId={anchorMessageId}
                   />
+                  {state.pendingPermission && (
+                    <PermissionPanel
+                      calls={state.pendingPermission.calls}
+                      onApprove={props.onApproveTools}
+                      onDeny={props.onDenyTools}
+                      onAlways={props.onAlwaysApprove}
+                      onFeedback={props.onFeedbackTools}
+                    />
+                  )}
                 </>
               );
             }
@@ -448,6 +475,15 @@ export function ChatApp(props: ChatAppProps) {
                 compactMode={settings.compactMode}
                 anchorMessageId={null}
               />
+              {state.pendingPermission && (
+                <PermissionPanel
+                  calls={state.pendingPermission.calls}
+                  onApprove={props.onApproveTools}
+                  onDeny={props.onDenyTools}
+                  onAlways={props.onAlwaysApprove}
+                  onFeedback={props.onFeedbackTools}
+                />
+              )}
             </>
           );
         })()}
@@ -622,7 +658,7 @@ export function ChatApp(props: ChatAppProps) {
         <EditLastPanel
           initial={(() => {
             const lastUser = [...state.messages].reverse().find((m) => m.role === 'user');
-            return lastUser?.content ?? '';
+            return lastUser ? getTextFromContent(lastUser.content) : '';
           })()}
           onClose={() => setEditLastOpen(false)}
           onSubmit={async (newText) => {
@@ -816,12 +852,11 @@ export function ChatApp(props: ChatAppProps) {
               setInput(v);
             }}
             onSubmit={submit}
-            disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen}
+            disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen || !!state.pendingPermission}
           />
         </Box>
         <Toasts toasts={state.toasts} />
-        {state.isGenerating && <StatusBar hint="Generating..." isGenerating={true} />}
-        <Text dimColor>“/” commands • “?” shortcuts • ↑↓ scroll</Text>
+        <StatusBar hint={dynamicHint} isGenerating={state.isGenerating} />
       </Box>
     </Box>
   );

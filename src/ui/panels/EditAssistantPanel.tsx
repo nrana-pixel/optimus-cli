@@ -5,6 +5,10 @@ import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
 import type { UIMessage } from '../types.js';
 
+function getTextFromContent(content: UIMessage['content']): string {
+  return content.map(block => block.type === 'text' ? block.text : '').join('\n');
+}
+
 export function EditAssistantPanel(props: {
   messages: UIMessage[];
   onClose: () => void;
@@ -21,12 +25,12 @@ export function EditAssistantPanel(props: {
   const filtered = useMemo(() => {
     const query = q.trim().toLowerCase();
     const base = props.messages.filter((m) => m.role === 'assistant');
-    const list = !query ? base : base.filter((m) => m.content.toLowerCase().includes(query));
+    const list = !query ? base : base.filter((m) => getTextFromContent(m.content).toLowerCase().includes(query));
     return list.slice(-30).reverse();
   }, [props.messages, q]);
 
   const items = filtered.map((m) => ({
-    label: `${m.content.replace(/\n/g, ' ').slice(0, 90)}`,
+    label: `${getTextFromContent(m.content).replace(/\n/g, ' ').slice(0, 90)}`,
     value: m.id,
   }));
 
@@ -47,7 +51,7 @@ export function EditAssistantPanel(props: {
                 const id = String(it.value);
                 setSelectedId(id);
                 const msg = props.messages.find((m) => m.id === id);
-                setText(msg?.content ?? '');
+                setText(msg ? getTextFromContent(msg.content) : '');
               }}
             />
           </Box>

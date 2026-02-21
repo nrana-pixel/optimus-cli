@@ -247,11 +247,11 @@ export class AgentOrchestrator {
       loops++;
       emit({ type: 'status', message: loops === 1 ? 'Generating…' : `Tool loop ${loops}/${maxLoops}…` });
 
-      const res = await this.llm.completeWithHistory(messages);
+      const res = await this.llm.completeWithHistory(messages, undefined, ToolsService.getNativeTools(false));
       step.tokens += res.tokensUsed.total;
       step.cost   += res.cost.total;
 
-      const toolCalls = ToolsService.parseToolCalls(res.content);
+      const toolCalls = res.toolCalls || [];
 
       if (!toolCalls.length) {
         // Final answer — no more tool calls
@@ -261,7 +261,7 @@ export class AgentOrchestrator {
       }
 
       // Execute each tool call
-      messages.push({ role: 'assistant', content: res.content });
+      messages.push({ role: 'assistant', content: res.content || 'Executing tools...' });
       const resultParts: string[] = [];
 
       for (const call of toolCalls) {
@@ -269,7 +269,7 @@ export class AgentOrchestrator {
           type: 'tool_call',
           message: `→ ${call.name}(${JSON.stringify(call.args)})`,
         });
-        const toolResult = await this.tools.execute(call);
+        const toolResult = await this.tools.execute(call as any);
         step.toolCalls.push(toolResult);
 
         const formatted = ToolsService.formatToolResult(toolResult);
@@ -390,28 +390,10 @@ export class AgentOrchestrator {
   // ─── System prompt builder ───────────────────────────────────────────────
 
   private buildSystemPrompt(contextString: string): string {
-    return `You are an elite coding agent — like Claude Code or GitHub Copilot Workspace.
-Your job is to implement the requested task accurately and completely in the existing codebase.
+    const localInstructions = ToolsService.readLocalInstructions(resolve('.'), resolve('.'));
+    const projectContext = ToolsService.readProjectContext(resolve('.'));
 
-${ToolsService.toolsSystemSection()}
-
-## Workflow
-1. Use tools to READ and UNDERSTAND relevant existing code BEFORE writing
-2. Once you understand the pattern, write complete, production-ready code
-3. Output files using this format for EACH file:
-   \`\`\`language:path/to/file.ext
-   // full file content here
-   \`\`\`
-4. Return the full file content — not diffs, not partial snippets
-5. Match the existing code style, imports, and naming conventions
-
-## Quality requirements
-- Complete, runnable code only (never TODO or placeholder)
-- Proper error handling
-- Match the project's existing patterns exactly
-- Import from the same paths used by existing files
-
-${contextString}`;
+    return ToolsService.toolsSystemSection(projectContext, false, localInstructions) + `\n\n${contextString}`;
   }
 
   // ─── Static report formatter ─────────────────────────────────────────────

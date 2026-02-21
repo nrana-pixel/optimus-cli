@@ -3,7 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { UIMessage, getTextFromContent } from '../types.js';
 
 export function BranchPanel(props: {
   messages: UIMessage[];
@@ -21,10 +21,10 @@ export function BranchPanel(props: {
     const base = props.messages.filter((m) => m.role !== 'system');
     const filtered = !query
       ? base
-      : base.filter((m) => `${m.role} ${m.content}`.toLowerCase().includes(query));
+      : base.filter((m) => `${m.role} ${getTextFromContent(m.content)}`.toLowerCase().includes(query));
 
     return filtered.slice(-30).reverse().map((m) => ({
-      label: `${m.role}: ${m.content.replace(/\n/g, ' ').slice(0, 90)}`,
+      label: `${m.role}: ${getTextFromContent(m.content).replace(/\n/g, ' ').slice(0, 90)}`,
       value: m.id,
     }));
   }, [props.messages, q]);

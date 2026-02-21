@@ -2,7 +2,7 @@ import React, { useMemo } from 'react';
 import { Box, Text, useInput } from 'ink';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { UIMessage, getTextFromContent } from '../types.js';
 
 export function PruneBranchPanel(props: {
   messages: UIMessage[];
@@ -25,7 +25,7 @@ export function PruneBranchPanel(props: {
       .slice(-40)
       .reverse()
       .map((m) => ({
-        label: `${m.role}: ${m.content.replace(/\n/g, ' ').slice(0, 90)}`,
+        label: `${m.role}: ${getTextFromContent(m.content).replace(/\n/g, ' ').slice(0, 90)}`,
         value: m.id,
       }));
   }, [props.messages]);

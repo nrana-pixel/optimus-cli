@@ -3,7 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { type UIMessage, getTextFromContent } from '../types.js';
 
 export function PinsPanel(props: {
   messages: UIMessage[];
@@ -40,7 +40,7 @@ export function PinsPanel(props: {
   const items = pinned.slice(-50).reverse().map((m: any) => {
     const t = (m.tags?.length ? m.tags.join(',') : '(untagged)');
     return {
-      label: `[${t}] ${m.role}: ${m.content.replace(/\n/g, ' ').slice(0, 80)}`,
+      label: `[${t}] ${m.role}: ${getTextFromContent(m.content).replace(/\n/g, ' ').slice(0, 80)}`,
       value: m.id,
     };
   });

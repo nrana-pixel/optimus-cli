@@ -2,7 +2,7 @@ import React, { useMemo } from 'react';
 import { Box, Text, useInput } from 'ink';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { UIMessage, getTextFromContent } from '../types.js';
 
 export function SiblingBranchesPanel(props: {
   messages: UIMessage[];
@@ -22,7 +22,7 @@ export function SiblingBranchesPanel(props: {
   }, [props.messages, props.parentId]);
 
   const items = children.map((c) => ({
-    label: `${c.role}: ${c.content.replace(/\n/g, ' ').slice(0, 90)}`,
+    label: `${c.role}: ${getTextFromContent(c.content).replace(/\n/g, ' ').slice(0, 90)}`,
     value: c.id,
   }));
 

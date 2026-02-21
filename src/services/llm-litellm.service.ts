@@ -30,10 +30,12 @@ export interface LLMResponse {
     total: number;
   };
   stopReason?: string;
+  toolCalls?: Array<{ id: string; name: string; args: any }>;
 }
 
 export interface LLMStreamCallback {
   onChunk?: (chunk: string) => void;
+  onToolCall?: (toolCall: { id: string; name: string; args: any }) => void;
   onComplete?: (response: LLMResponse) => void;
   onError?: (error: Error) => void;
 }
@@ -123,12 +125,13 @@ export class LLMServiceLiteLLM {
   async complete(
     message: string,
     systemPrompt?: string,
-    callbacks?: LLMStreamCallback
+    callbacks?: LLMStreamCallback,
+    tools?: any[]
   ): Promise<LLMResponse> {
     const messages: Array<{ role: string; content: string }> = [];
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
     messages.push({ role: 'user', content: message });
-    return this.completeWithHistory(messages, callbacks);
+    return this.completeWithHistory(messages, callbacks, tools);
   }
 
   /**
@@ -136,11 +139,12 @@ export class LLMServiceLiteLLM {
    */
   async completeWithHistory(
     messages: Array<{ role: string; content: string | any[] }>,
-    callbacks?: LLMStreamCallback
+    callbacks?: LLMStreamCallback,
+    tools?: any[]
   ): Promise<LLMResponse> {
     // Use native REST for Gemini (the JS litellm package does not support it well)
     if (this.provider === 'gemini') {
-      return this.completeGeminiNative(messages, callbacks);
+      return this.completeGeminiNative(messages, callbacks, tools);
     }
 
     try {
@@ -159,29 +163,57 @@ export class LLMServiceLiteLLM {
       try {
         if (callbacks?.onChunk) {
           // Streaming mode
-          response = await litellm.completion({
+          const args: any = {
             model: modelString,
             messages,
             temperature: 0.7,
             max_tokens: 8192,
             stream: true,
-          });
+          };
+          if (tools && tools.length > 0) args.tools = tools;
+
+          response = await litellm.completion(args);
 
           let fullContent = '';
           let inputTokens = 0;
           let outputTokens = 0;
+          let finishReason: string | undefined;
+          const toolCallsMap = new Map<number, any>();
 
           for await (const chunk of response) {
-            const delta = chunk.choices?.[0]?.delta?.content;
-            if (delta) {
-              fullContent += delta;
-              callbacks.onChunk(delta);
+            const delta = chunk.choices?.[0]?.delta;
+            if (delta?.content) {
+              fullContent += delta.content;
+              callbacks.onChunk(delta.content);
+            }
+            if (delta?.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                const idx = tc.index;
+                if (!toolCallsMap.has(idx)) {
+                  toolCallsMap.set(idx, { id: tc.id, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+                } else {
+                  const existing = toolCallsMap.get(idx);
+                  if (tc.function?.arguments) existing.args += tc.function.arguments;
+                }
+              }
+            }
+            if (chunk.choices?.[0]?.finish_reason) {
+              finishReason = chunk.choices[0].finish_reason;
             }
             // Track tokens from the final chunk if available
             if (chunk.usage) {
               inputTokens = chunk.usage.prompt_tokens || 0;
               outputTokens = chunk.usage.completion_tokens || 0;
             }
+          }
+
+          const parsedToolCalls: Array<{ id: string; name: string; args: any }> = [];
+          for (const tc of toolCallsMap.values()) {
+            let parsedArgs = {};
+            try { parsedArgs = JSON.parse(tc.args || '{}'); } catch { /* ignore */ }
+            const call = { id: tc.id, name: tc.name, args: parsedArgs };
+            parsedToolCalls.push(call);
+            if (callbacks.onToolCall) callbacks.onToolCall(call);
           }
 
           const cost = this.calculateCost(inputTokens, outputTokens);
@@ -191,20 +223,24 @@ export class LLMServiceLiteLLM {
             provider: this.provider,
             tokensUsed: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens },
             cost,
-            stopReason: 'stop',
+            stopReason: finishReason || 'stop',
+            toolCalls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
           };
 
           if (callbacks.onComplete) callbacks.onComplete(result);
           return result;
         } else {
           // Non-streaming mode
-          response = await litellm.completion({
+          const args: any = {
             model: modelString,
             messages,
             temperature: 0.7,
             max_tokens: 8192,
             stream: false,
-          });
+          };
+          if (tools && tools.length > 0) args.tools = tools;
+
+          response = await litellm.completion(args);
 
           const parsed = this.parseLiteLLMResponse(response);
           if (callbacks?.onComplete) callbacks.onComplete(parsed);
@@ -227,7 +263,8 @@ export class LLMServiceLiteLLM {
    */
   private async completeGeminiNative(
     messages: Array<{ role: string; content: string | any[] }>,
-    callbacks?: LLMStreamCallback
+    callbacks?: LLMStreamCallback,
+    tools?: any[]
   ): Promise<LLMResponse> {
     try {
       // Separate ALL system messages and merge them
@@ -275,6 +312,29 @@ export class LLMServiceLiteLLM {
         generationConfig: { temperature: 0.7, maxOutputTokens: 65536 },
       };
 
+      if (tools && tools.length > 0) {
+        body.tools = [{
+          functionDeclarations: tools.map(t => {
+            // Translate OpenAI schema to Gemini schema
+            const props = t.function.parameters?.properties || {};
+            const req = t.function.parameters?.required || [];
+            const geminiProps: Record<string, any> = {};
+            for (const [k, v] of Object.entries(props)) {
+              geminiProps[k] = { ... (v as any), type: ((v as any).type || 'string').toUpperCase() };
+            }
+            return {
+              name: t.function.name,
+              description: t.function.description || '',
+              parameters: {
+                type: 'OBJECT',
+                properties: geminiProps,
+                required: req
+              }
+            };
+          })
+        }];
+      }
+
       if (systemInstruction) {
         body.systemInstruction = { parts: [{ text: systemInstruction }] };
       }
@@ -301,7 +361,20 @@ export class LLMServiceLiteLLM {
       }
 
       const data: any = await response.json();
-      const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const content = parts.map((p: any) => p.text || '').join('');
+      
+      const toolCalls: Array<{ id: string; name: string; args: any }> = [];
+      for (const p of parts) {
+        if (p.functionCall) {
+          toolCalls.push({
+            id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            name: p.functionCall.name,
+            args: p.functionCall.args || {}
+          });
+        }
+      }
+
       const inputTokens  = data.usageMetadata?.promptTokenCount     || 0;
       const outputTokens = data.usageMetadata?.candidatesTokenCount || 0;
       const cost = this.calculateCost(inputTokens, outputTokens);
@@ -313,6 +386,7 @@ export class LLMServiceLiteLLM {
         tokensUsed: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens },
         cost,
         stopReason: data.candidates?.[0]?.finishReason,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       };
 
       if (callbacks?.onComplete) callbacks.onComplete(result);
@@ -354,6 +428,7 @@ export class LLMServiceLiteLLM {
     let inputTokens = 0;
     let outputTokens = 0;
     let finishReason: string | undefined;
+    const toolCallsMap = new Map<string, any>();
 
     try {
       while (true) {
@@ -372,11 +447,25 @@ export class LLMServiceLiteLLM {
 
           try {
             const parsed = JSON.parse(data);
-            const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (text) {
-              fullContent += text;
-              if (callbacks.onChunk) callbacks.onChunk(text);
+            const parts = parsed.candidates?.[0]?.content?.parts || [];
+            
+            for (const p of parts) {
+              if (p.text) {
+                fullContent += p.text;
+                if (callbacks.onChunk) callbacks.onChunk(p.text);
+              }
+              if (p.functionCall) {
+                const name = p.functionCall.name;
+                if (!toolCallsMap.has(name)) {
+                  toolCallsMap.set(name, { id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, name, args: p.functionCall.args || {} });
+                } else {
+                  // Gemini doesn't stream function calls delta by delta, it usually sends the whole call in one chunk
+                  const existing = toolCallsMap.get(name);
+                  Object.assign(existing.args, p.functionCall.args || {});
+                }
+              }
             }
+            
             // Track usage from the last chunk
             if (parsed.usageMetadata) {
               inputTokens = parsed.usageMetadata.promptTokenCount || 0;
@@ -394,6 +483,12 @@ export class LLMServiceLiteLLM {
       reader.releaseLock();
     }
 
+    const parsedToolCalls: Array<{ id: string; name: string; args: any }> = [];
+    for (const tc of toolCallsMap.values()) {
+      parsedToolCalls.push(tc);
+      if (callbacks.onToolCall) callbacks.onToolCall(tc);
+    }
+
     const cost = this.calculateCost(inputTokens, outputTokens);
 
     const result: LLMResponse = {
@@ -403,6 +498,7 @@ export class LLMServiceLiteLLM {
       tokensUsed: { input: inputTokens, output: outputTokens, total: inputTokens + outputTokens },
       cost,
       stopReason: finishReason,
+      toolCalls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
     };
 
     if (callbacks.onComplete) callbacks.onComplete(result);
@@ -434,6 +530,20 @@ export class LLMServiceLiteLLM {
     const inputTokens = data.usage?.prompt_tokens || 0;
     const outputTokens = data.usage?.completion_tokens || 0;
     const cost = this.calculateCost(inputTokens, outputTokens);
+    
+    let toolCalls;
+    const rawToolCalls = data.choices?.[0]?.message?.tool_calls;
+    if (rawToolCalls && Array.isArray(rawToolCalls)) {
+      toolCalls = rawToolCalls.map((tc: any) => {
+        let args = {};
+        try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { /* ignore */ }
+        return {
+          id: tc.id,
+          name: tc.function?.name || '',
+          args
+        };
+      });
+    }
 
     return {
       content,
@@ -446,6 +556,7 @@ export class LLMServiceLiteLLM {
       },
       cost,
       stopReason: data.choices?.[0]?.finish_reason,
+      toolCalls
     };
   }
 

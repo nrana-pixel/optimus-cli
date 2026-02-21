@@ -3,7 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { UIMessage, getTextFromContent } from '../types.js';
 
 export function DeleteMessagePanel(props: {
   messages: UIMessage[];
@@ -19,12 +19,12 @@ export function DeleteMessagePanel(props: {
   const filtered = useMemo(() => {
     const query = q.trim().toLowerCase();
     const base = props.messages.filter((m) => m.role !== 'system');
-    const list = !query ? base : base.filter((m) => `${m.role} ${m.content}`.toLowerCase().includes(query));
+    const list = !query ? base : base.filter((m) => `${m.role} ${getTextFromContent(m.content)}`.toLowerCase().includes(query));
     return list.slice(-40).reverse();
   }, [props.messages, q]);
 
   const items = filtered.map((m) => ({
-    label: `${m.role}: ${m.content.replace(/\n/g, ' ').slice(0, 90)}`,
+    label: `${m.role}: ${getTextFromContent(m.content).replace(/\n/g, ' ').slice(0, 90)}`,
     value: m.id,
   }));
 

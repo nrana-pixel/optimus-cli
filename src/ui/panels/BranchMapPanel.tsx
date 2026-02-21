@@ -3,7 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import { Modal } from './Modal.js';
 import { useTheme } from '../Theme.js';
-import type { UIMessage } from '../types.js';
+import { type UIMessage, getTextFromContent } from '../types.js';
 
 type TreeRow = { id: string; text: string };
 
@@ -21,7 +21,7 @@ function buildTree(messages: UIMessage[]): TreeRow[] {
 
   const lines: TreeRow[] = [];
   const walk = (node: UIMessage, prefix: string) => {
-    const label = `${node.role}: ${node.content.replace(/\n/g, ' ').slice(0, 60)}`;
+    const label = `${node.role}: ${getTextFromContent(node.content).replace(/\n/g, ' ').slice(0, 60)}`;
     lines.push({ id: node.id, text: prefix + label });
     const kids = (children.get(node.id) ?? []).slice(0, 10);
     kids.forEach((k, idx) => {

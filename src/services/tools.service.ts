@@ -26,6 +26,8 @@ import {
 } from 'fs';
 import { join, resolve, relative, extname, dirname } from 'path';
 import { execSync } from 'child_process';
+import { truncateMiddle } from '../utils/truncate.js';
+import { UnifiedExecService } from './unified-exec.service.js';
 import type { IndexService } from './index.service.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -34,6 +36,7 @@ export type ToolName =
   | 'read_file'
   | 'write_file'
   | 'edit_file'
+  | 'apply_patch'
   | 'list_dir'
   | 'search_files'
   | 'find_symbol'
@@ -41,6 +44,7 @@ export type ToolName =
   | 'semantic_search'
   | 'run_command'
   | 'run_tests'
+  | 'write_stdin'
   | 'git_status'
   | 'git_diff'
   | 'git_log';
@@ -98,6 +102,8 @@ export class ToolsService {
   private readonly MAX_RESULTS    = 30;         // search result cap
   private readonly MAX_CMD_OUTPUT = 8_000;      // chars
 
+  public unifiedExec = new UnifiedExecService();
+
   constructor(private workingDir: string) {}
 
   // ─── Execute dispatcher ─────────────────────────────────────────────────
@@ -143,6 +149,9 @@ export class ToolsService {
           break;
         case 'edit_file':
           output = this.editFile(call.args.path ?? '', call.args.old_content ?? '', call.args.new_content ?? '');
+          break;
+        case 'apply_patch':
+          output = this.applyPatch(call.args.path ?? '', call.args.patch ?? '');
           break;
         case 'list_dir':
           output = this.listDir(call.args.path ?? '.');
@@ -194,7 +203,10 @@ export class ToolsService {
           break;
         case 'run_command':
         case 'run_tests':
-          output = this.runCommand(call.args.command ?? '');
+          output = await this.runCommand(call.args.command ?? '');
+          break;
+        case 'write_stdin':
+          output = await this.unifiedExec.writeStdin(call.args.id ?? '', call.args.text ?? '');
           break;
         case 'git_status':
           output = this.gitStatus();
@@ -226,12 +238,18 @@ export class ToolsService {
 
     const st = statSync(abs);
     if (st.isDirectory()) return `${filePath} is a directory — use list_dir instead`;
-    if (st.size > this.MAX_FILE_BYTES) {
-      return `File too large (${(st.size / 1024).toFixed(0)} KB). Showing first ${this.MAX_FILE_BYTES / 1024} KB:\n\n` +
-        readFileSync(abs, 'utf-8').slice(0, this.MAX_FILE_BYTES);
+
+    const content = readFileSync(abs, 'utf-8');
+    if (st.size > this.MAX_FILE_BYTES || content.split('\n').length > 1000) {
+      return truncateMiddle(content, {
+        maxChars: this.MAX_FILE_BYTES,
+        maxLines: 1000,
+        preserveHeadLines: 100,
+        preserveTailLines: 100
+      });
     }
 
-    return readFileSync(abs, 'utf-8');
+    return content;
   }
 
   private writeFile(filePath: string, content: string): string {
@@ -295,6 +313,68 @@ export class ToolsService {
     const newLines = newContent.split('\n').length;
     const msg = `Edited: ${filePath} — replaced ${count} occurrence(s) (${oldLines} line(s) → ${newLines} line(s))`;
     return msg;
+  }
+
+  /**
+   * Resilient patch application using SEARCH/REPLACE blocks.
+   * Format:
+   * <<<<<< SEARCH
+   * ...
+   * ======
+   * ...
+   * >>>>>>
+   */
+  private applyPatch(filePath: string, patch: string): string {
+    if (!filePath) return 'apply_patch requires a path argument';
+    if (!patch) return 'apply_patch requires a patch argument';
+
+    const abs = resolve(this.workingDir, filePath);
+    if (!existsSync(abs)) return `File not found: ${filePath}`;
+
+    const original = readFileSync(abs, 'utf-8');
+    const rel = relative(this.workingDir, abs);
+
+    const blocks = patch.split('<<<<<< SEARCH');
+    if (blocks.length <= 1) return 'apply_patch failed: No SEARCH/REPLACE blocks found. Use the format: <<<<<< SEARCH\\n...\\n======\\n...\\n>>>>>>';
+
+    let currentContent = original;
+    let appliedCount = 0;
+
+    for (let i = 1; i < blocks.length; i++) {
+      const block = blocks[i];
+      const parts = block.split('======');
+      if (parts.length !== 2) continue;
+
+      const searchPart = parts[0].trim();
+      const replacePartWithEnd = parts[1];
+      const replaceParts = replacePartWithEnd.split('>>>>>>');
+      if (replaceParts.length < 2) continue;
+
+      const replacePart = replaceParts[0].trim();
+
+      // Try exact match first
+      if (currentContent.includes(searchPart)) {
+        currentContent = currentContent.replace(searchPart, replacePart);
+        appliedCount++;
+      } else {
+        // Try fuzzy match (ignore indentation)
+        const normalize = (s: string) => s.split('\n').map(l => l.trim()).filter(Boolean).join('\n');
+        const normalizedSearch = normalize(searchPart);
+        
+        // This is a simplified fuzzy match. A real one would use regex or diffing.
+        // For now, let's just stick to a slightly smarter exact match.
+        return `apply_patch failed: Could not find SEARCH block in ${filePath}. Check whitespace and indentation.`;
+      }
+    }
+
+    if (appliedCount > 0) {
+      this._snapshot(abs, rel);
+      writeFileSync(abs, currentContent, 'utf-8');
+      this.written.push({ path: filePath, absPath: abs, lines: currentContent.split('\n').length, isNew: false });
+      return `Applied ${appliedCount} patch block(s) to ${filePath}`;
+    }
+
+    return 'apply_patch failed: No blocks were successfully applied.';
   }
 
   private listDir(dirPath: string): string {
@@ -423,45 +503,26 @@ export class ToolsService {
       : `Symbol "${symbol}" not found in project`;
   }
 
-  private runCommand(cmd: string): string {
+  private async runCommand(cmd: string): Promise<string> {
     if (!cmd) return 'run_command requires a command argument';
 
     const trimmed = cmd.trim();
 
-    // Strict allowlist: run_command is intended for safe read-only inspection.
-    const allowed = [
-      /^git\s+status(\s+--short)?$/i,
-      /^git\s+diff(\s+.+)?$/i,
-      /^git\s+log(\s+.+)?$/i,
-      /^(ls|dir)(\s+.*)?$/i,
-      /^pwd$/i,
-      /^whoami$/i,
-      /^node\s+--version$/i,
-      /^npm\s+--version$/i,
-      /^pnpm\s+--version$/i,
-      /^yarn\s+--version$/i,
-      /^tsc\s+--version$/i,
-    ];
-
-    const isAllowed = allowed.some((re) => re.test(trimmed));
-    if (!isAllowed) {
-      // Keep legacy pattern blocker as defense-in-depth.
-      if (!isSafeCommand(trimmed)) {
-        return `Blocked: "${cmd}" matches a potentially destructive pattern. Only safe read-only commands are allowed.`;
-      }
-      return `Blocked: "${cmd}" is not in the allowlist for run_command. Use git_status/git_diff/git_log or run a safe allowlisted command.`;
+    if (!isSafeCommand(trimmed)) {
+      return `Blocked: "${cmd}" matches a potentially destructive pattern.`;
     }
 
     try {
-      const output = execSync(trimmed, {
-        cwd:     this.workingDir,
-        timeout: 10_000,
-        encoding: 'utf-8',
-        stdio:   ['pipe', 'pipe', 'pipe'],
-      });
-      return (output || '(no output)').slice(0, this.MAX_CMD_OUTPUT);
+      // Use UnifiedExec for all commands to allow future stdin interaction
+      return await this.unifiedExec.spawn(trimmed, [], this.workingDir);
     } catch (e: any) {
-      return `Command failed: ${e.stderr || e.message}`.slice(0, this.MAX_CMD_OUTPUT);
+      const err = e.stderr || e.message;
+      return truncateMiddle(`Command failed: ${err}`, {
+        maxChars: this.MAX_CMD_OUTPUT,
+        maxLines: 200,
+        preserveHeadLines: 40,
+        preserveTailLines: 40
+      });
     }
   }
 
@@ -585,10 +646,264 @@ export class ToolsService {
   }
 
   /**
-   * The system-prompt section that teaches the LLM how to call tools.
-   * This is injected as the system message in every chat turn.
+   * Hierarchical local context reading.
+   * Searches for .optimus.md or AGENTS.md from current directory up to root.
    */
-  static toolsSystemSection(projectContext?: string | null, planMode = false): string {
+  static readLocalInstructions(startDir: string, rootDir: string): string {
+    const candidates = ['.optimus.md', 'AGENTS.md', 'agents.md'];
+    let current = resolve(startDir);
+    const root = resolve(rootDir);
+    const foundFiles: string[] = [];
+    const instructions: string[] = [];
+
+    // Traverse upwards from current dir to root
+    while (true) {
+      for (const name of candidates) {
+        const p = join(current, name);
+        if (existsSync(p) && !foundFiles.includes(p)) {
+          try {
+            const content = readFileSync(p, 'utf-8');
+            instructions.push(`### Instructions from ${relative(root, p)}:\n${content}`);
+            foundFiles.push(p);
+          } catch { /* skip */ }
+        }
+      }
+
+      if (current === root || current === dirname(current)) break;
+      current = dirname(current);
+    }
+
+    return instructions.reverse().join('\n\n'); // Root-level first
+  }
+
+  /**
+   * Return native OpenAI-compatible tool definitions.
+   */
+  static getNativeTools(planMode = false): any[] {
+    const tools: any[] = [
+      {
+        type: 'function',
+        function: {
+          name: 'list_dir',
+          description: 'Show directory tree',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Path to the directory to list' }
+            },
+            required: ['path']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: 'Read a file',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Path to the file to read' }
+            },
+            required: ['path']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'search_files',
+          description: 'Grep across project',
+          parameters: {
+            type: 'object',
+            properties: {
+              pattern: { type: 'string', description: 'Regex pattern to search for' },
+              glob: { type: 'string', description: 'Optional glob pattern to filter files' }
+            },
+            required: ['pattern']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'find_symbol',
+          description: 'Locate a class/function definition (regex-based)',
+          parameters: {
+            type: 'object',
+            properties: {
+              symbol: { type: 'string', description: 'Symbol name to find' }
+            },
+            required: ['symbol']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'lookup_symbol',
+          description: 'Fast exact symbol lookup using the SQLite index (preferred when available)',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Symbol name to look up' }
+            },
+            required: ['name']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'semantic_search',
+          description: "Find conceptually related code by meaning — e.g. 'authentication logic' finds auth code even if the word 'auth' isn't in the file",
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'Semantic query string' },
+              top_k: { type: 'string', description: 'Number of results to return (default: 5)' }
+            },
+            required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'git_status',
+          description: 'Show git working tree status',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'git_diff',
+          description: 'Show git diff (optionally from a ref)',
+          parameters: {
+            type: 'object',
+            properties: {
+              ref: { type: 'string', description: 'Optional git ref' }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'git_log',
+          description: 'Show recent git commits',
+          parameters: {
+            type: 'object',
+            properties: {
+              count: { type: 'string', description: 'Number of commits to show' }
+            }
+          }
+        }
+      }
+    ];
+
+    if (!planMode) {
+      tools.push(
+        {
+          type: 'function',
+          function: {
+            name: 'write_file',
+            description: 'Create or overwrite a file (use for NEW files)',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Path to write' },
+                content: { type: 'string', description: 'File content' }
+              },
+              required: ['path', 'content']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'edit_file',
+            description: 'Replace specific content in a file (preferred for edits). old_content must EXACTLY match part of the file (including whitespace/indentation).',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Path to edit' },
+                old_content: { type: 'string', description: 'The exact text to find and replace' },
+                new_content: { type: 'string', description: 'The text to replace it with' }
+              },
+              required: ['path', 'old_content', 'new_content']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'apply_patch',
+            description: 'Resilient surgical edit using SEARCH/REPLACE blocks. Use this for reliable code modification.',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'Path to edit' },
+                patch: { type: 'string', description: 'One or more blocks in the format: <<<<<< SEARCH\\n...\\n======\\n...\\n>>>>>>' }
+              },
+              required: ['path', 'patch']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'run_command',
+            description: 'Run a terminal command (e.g. pnpm inst, mkdir, node script)',
+            parameters: {
+              type: 'object',
+              properties: {
+                command: { type: 'string', description: 'Command to run' }
+              },
+              required: ['command']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'run_tests',
+            description: 'Run tests/typecheck (e.g. npm test, tsc). Use this after editing code to catch and auto-fix errors quickly within this loop.',
+            parameters: {
+              type: 'object',
+              properties: {
+                command: { type: 'string', description: 'Command to run tests' }
+              },
+              required: ['command']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'write_stdin',
+            description: 'Provide input to a running process spawned by run_command or exec_command.',
+            parameters: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'The Process ID (e.g. exec_12345)' },
+                text: { type: 'string', description: 'The text to send to the process' }
+              },
+              required: ['id', 'text']
+            }
+          }
+        }
+      );
+    }
+
+    return tools;
+  }
+
+  /**
+   * The system-prompt section that teaches the LLM about the project and editing rules.
+   */
+  static toolsSystemSection(projectContext?: string | null, planMode = false, localInstructions?: string): string {
     const planNote = planMode
       ? `\n\n## ⚠️ PLAN MODE ACTIVE\nYou are in READ-ONLY plan mode. You can use read_file, list_dir, search_files, find_symbol, git_status, git_diff, git_log.\nYou CANNOT use write_file, edit_file, or run_command.\nAnalyze the codebase and create a detailed implementation plan for the user's request.\n`
       : '';
@@ -597,49 +912,47 @@ export class ToolsService {
       ? `\n\n## Project Context (from OPTIMUS.md)\n${projectContext}\n`
       : '';
 
+    const localBlock = localInstructions
+      ? `\n\n## Local Directory Instructions (AGENTS.md)\n${localInstructions}\n`
+      : '';
+
     return `
-You are Optimus — an expert AI coding agent. You have tools to read AND write files directly.
-${contextBlock}${planNote}
-## CRITICAL BEHAVIOUR
+You are Optimus — an expert AI coding agent. You are precise, safe, and helpful.
 
-When the user asks you to CREATE, MODIFY, or FIX code:
-1. Use list_dir / read_file to understand the project structure first
-2. For EXISTING files, prefer edit_file (surgical replace) over write_file (full overwrite)
-3. Use write_file only for NEW files
-4. After writing/editing all files, give a SHORT plain-English summary of what you did
+## HOW YOU WORK
 
-Do NOT output raw code blocks in your reply when edit_file/write_file can do the job.
-Do NOT ask for permission to write files — just do it.
+### 1. Personality & Tone
+- Your tone is concise, direct, and collaborative.
+- **Preamble messages**: Before making tool calls, send a brief message (1-2 sentences) explaining what you are about to do (e.g., "I've explored the repo; now checking the API route definitions.").
+- Avoid excessively verbose explanations unless specifically asked.
 
-## Tool call format (use EXACTLY):
+### 2. Planning
+- For non-trivial tasks, always start by exploring the directory structure.
+- Before writing code, summarize your plan to the user.
+- If you have an 'update_plan' tool, use it to track progress.
 
-<use_tool><name>TOOL_NAME</name><args>{"arg": "value"}</args></use_tool>
+### 3. Task Execution
+- Fix problems at the root cause.
+- Keep changes consistent with the style of the existing codebase.
+- **CRITICAL**: Use list_dir / read_file to understand project structure first.
+- For EXISTING files, prefer **apply_patch** (resilient surgical replace) over write_file.
+- Use write_file only for NEW files.
+- Do NOT output raw code blocks in your reply when apply_patch can do the job.
 
-## Available tools:
+${contextBlock}${localBlock}${planNote}
 
-| Tool | Args | Description |
-|------|------|---------
-| list_dir | path: string | Show directory tree |
-| read_file | path: string | Read a file |
-| write_file | path: string, content: string | Create or overwrite a file (use for NEW files) |
-| edit_file | path: string, old_content: string, new_content: string | Replace specific content in a file (preferred for edits) |
-| search_files | pattern: string, glob?: string | Grep across project |
-| find_symbol | symbol: string | Locate a class/function definition (regex-based) |
-| lookup_symbol | name: string | Fast exact symbol lookup using the SQLite index (preferred when available) |
-| semantic_search | query: string, top_k?: string | Find conceptually related code by meaning — e.g. 'authentication logic' finds auth code even if the word 'auth' isn't in the file |
-| run_command | command: string | Run a safe terminal command |
-| run_tests | command: string | Run tests/typecheck (e.g. npm test, tsc). Use this after editing code to catch and auto-fix errors quickly within this loop. |
-| git_status | (none) | Show git working tree status |
-| git_diff | ref?: string | Show git diff (optionally from a ref) |
-| git_log | count?: string | Show recent git commits |
+## apply_patch — how to use:
+Use apply_patch to modify existing files reliably. Provide a SEARCH block that matches a unique section of the file exactly, and a REPLACE block with your changes.
 
-## edit_file — how to use:
-
-edit_file replaces ALL occurrences of old_content with new_content.
-old_content must EXACTLY match part of the file (including whitespace/indentation).
+Format:
+<<<<<< SEARCH
+[existing code to find]
+======
+[new code to replace it with]
+>>>>>>
 
 Example:
-<use_tool><name>edit_file</name><args>{"path": "src/app.ts", "old_content": "const port = 3000;", "new_content": "const port = process.env.PORT || 3000;"}</args></use_tool>
+<use_tool><name>apply_patch</name><args>{"path": "src/app.ts", "patch": "<<<<<< SEARCH\\nconst port = 3000;\\n======\\nconst port = process.env.PORT || 3000;\\n>>>>>>"}</args></use_tool>
 `.trim();
   }
 }

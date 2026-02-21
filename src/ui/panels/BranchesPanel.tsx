@@ -2,7 +2,7 @@ import React, { useMemo } from 'react';
 import { Box, Text, useInput } from 'ink';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { UIMessage, getTextFromContent } from '../types.js';
 
 export interface BranchItem {
   rootId: string;
@@ -29,7 +29,7 @@ export function BranchesPanel(props: {
     const roots: BranchItem[] = [];
     for (const [pid, count] of childrenOf.entries()) {
       const parent = props.messages.find((m) => m.id === pid);
-      const preview = parent ? `${parent.role}: ${parent.content.replace(/\n/g, ' ').slice(0, 70)}` : pid;
+      const preview = parent ? `${parent.role}: ${getTextFromContent(parent.content).replace(/\n/g, ' ').slice(0, 70)}` : pid;
       roots.push({ rootId: pid, label: `${preview}  (${count} replies)` });
     }
 

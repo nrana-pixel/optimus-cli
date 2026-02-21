@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Text } from 'ink';
 import { ChatApp } from '../ChatApp.js';
 import { ThemeProvider } from '../Theme.js';
-import type { FileDiff, ToolRun, UIMessage } from '../types.js';
+import { type FileDiff, type ToolRun, type UIMessage, getTextFromContent } from '../types.js';
 import type { Toast } from '../Toasts.js';
 import type { SessionListItem } from '../panels/SessionsPanel.js';
 import type { GlobalSearchHit } from '../panels/SearchAllPanel.js';
@@ -18,8 +18,9 @@ import { ConfigService } from '../../services/config.service.js';
  *
  * This is intentionally pragmatic: we keep a single source of truth for agent orchestration.
  */
-export function ChatUIController() {
+export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) {
   const engineRef = useRef<ChatEngine | null>(null);
+  const [initialPromptHandled, setInitialPromptHandled] = useState(false);
 
   // UI state mirrors engine runtime state
   const [messages, setMessages] = useState<UIMessage[]>([]);
@@ -45,6 +46,7 @@ export function ChatUIController() {
   const [toolsEnabled, setToolsEnabled] = useState(true);
   const [planMode, setPlanMode] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [pendingPermission, setPendingPermission] = useState<{ calls: any[], resolve: (v: import('../../chat/chat-engine.js').PermissionResult) => void } | null>(null);
 
   const tokenLimit = 128_000;
 
@@ -75,7 +77,25 @@ export function ChatUIController() {
         setToolsEnabled(s.toolsEnabled);
         setPlanMode(s.planMode);
       },
-      onMessage: (m: UIMessage) => setMessages((prev) => [...prev, m]),
+      onMessage: (m: UIMessage) => setMessages((prev) => {
+        // If this message was being streamed, replace it with the final version
+        const idx = prev.findIndex(item => item.id === m.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = m;
+          return next;
+        }
+        return [...prev, m];
+      }),
+      onPartialMessage: (m: UIMessage) => setMessages((prev) => {
+        const idx = prev.findIndex(item => item.id === m.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = { ...next[idx], content: m.content };
+          return next;
+        }
+        return [...prev, m];
+      }),
       onTools: (t: ToolRun[]) => setTools(t),
       onDiffs: (d: FileDiff[]) => {
         setDiffs(d);
@@ -90,6 +110,9 @@ export function ChatUIController() {
       onSnapshots: (toolRunId: string, snapshots: any[]) => {
         setSnapshotGroups((prev) => ({ ...prev, [toolRunId]: snapshots }));
       },
+      onPermissionRequest: (calls: any[]) => new Promise<import('../../chat/chat-engine.js').PermissionResult>((resolve) => {
+        setPendingPermission({ calls, resolve });
+      }),
     });
 
     // apply persisted theme/provider (if any)
@@ -207,9 +230,7 @@ export function ChatUIController() {
       setMessages((remaining ?? []).map((m: any) => ({
         id: m.id,
         role: m.role,
-        content: Array.isArray(m.content)
-          ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-          : String(m.content),
+        content: m.content,
         timestamp: m.timestamp,
         pinned: m.pinned,
         reactions: m.reactions,
@@ -241,9 +262,7 @@ export function ChatUIController() {
         setMessages((loaded.messages ?? []).map((m: any) => ({
           id: m.id,
           role: m.role,
-          content: Array.isArray(m.content)
-            ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-            : String(m.content),
+          content: m.content,
           timestamp: m.timestamp,
           pinned: m.pinned,
           reactions: m.reactions,
@@ -297,6 +316,25 @@ export function ChatUIController() {
       const ok = engine.deleteSession(id);
       pushToast(ok ? 'success' : 'error', ok ? 'Session deleted' : 'Delete failed');
       await refreshSessions();
+      return;
+    }
+
+    if (text.startsWith('/mode ')) {
+      await incUsage('mode-cmd');
+      const mode = text.replace('/mode', '').trim().toLowerCase();
+      if (!['interactive', 'trusted', 'on-failure'].includes(mode)) {
+        pushToast('error', `Invalid mode. Use: interactive, trusted, on-failure`);
+        return;
+      }
+      try {
+        ConfigService.updateConfig({ autonomyMode: mode as any });
+        if (engineRef.current) {
+          (engineRef.current as any).autonomyMode = mode;
+        }
+        pushToast('success', `Autonomy mode set to: ${mode}`);
+      } catch (err: any) {
+        pushToast('error', `Failed to set mode: ${err.message}`);
+      }
       return;
     }
 
@@ -413,7 +451,7 @@ export function ChatUIController() {
       msg.content = newContent;
       msg.editedAt = new Date().toISOString();
       engine.saveSession();
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: String(newContent), editedAt: msg.editedAt } : m)));
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: typeof newContent === 'string' ? [{ type: 'text', text: newContent }] : newContent, editedAt: msg.editedAt } : m)));
       pushToast('success', 'Assistant message edited');
       return;
     }
@@ -442,7 +480,7 @@ export function ChatUIController() {
       engine.saveSession();
 
       // Update UI message content
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: String(newContent), editedAt: msg.editedAt } : m)));
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: typeof newContent === 'string' ? [{ type: 'text', text: newContent }] : newContent, editedAt: msg.editedAt } : m)));
 
       // Start branch from this message
       setBranchParentId(messageId);
@@ -560,9 +598,7 @@ export function ChatUIController() {
             const who = m.role === 'user' ? 'You' : m.role === 'assistant' ? 'Optimus' : 'System';
             lines.push(`## ${who}`);
             lines.push('');
-            const txt = Array.isArray(m.content)
-              ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-              : String(m.content);
+            const txt = getTextFromContent(m.content as any);
             lines.push(txt);
             lines.push('');
           }
@@ -599,9 +635,7 @@ export function ChatUIController() {
           setMessages((loaded.messages ?? []).map((m: any) => ({
             id: m.id,
             role: m.role,
-            content: Array.isArray(m.content)
-              ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-              : String(m.content),
+            content: m.content,
             timestamp: m.timestamp,
             pinned: m.pinned,
             reactions: m.reactions,
@@ -707,9 +741,7 @@ export function ChatUIController() {
       const hits: GlobalSearchHit[] = [];
       for (const s of list) {
         for (const m of s.messages ?? []) {
-          const content = Array.isArray(m.content)
-            ? m.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-            : String(m.content);
+          const content = getTextFromContent(m.content as any);
           if (content.toLowerCase().includes(query)) {
             hits.push({
               sessionId: s.id,
@@ -747,6 +779,13 @@ export function ChatUIController() {
     }
     await refreshSessions();
   }, [ensureEngine, refreshSessions]);
+
+  useEffect(() => {
+    if (initialPrompt && !initialPromptHandled && !isGenerating) {
+      setInitialPromptHandled(true);
+      onSubmit(initialPrompt);
+    }
+  }, [initialPrompt, initialPromptHandled, isGenerating, onSubmit]);
 
   const onRegenerateLast = useCallback(async () => {
     const engine = await ensureEngine();
@@ -798,6 +837,34 @@ export function ChatUIController() {
     await engine.reactLast(reaction);
   }, [ensureEngine]);
 
+  const onApproveTools = useCallback(() => {
+    if (pendingPermission) {
+      pendingPermission.resolve('yes');
+      setPendingPermission(null);
+    }
+  }, [pendingPermission]);
+
+  const onDenyTools = useCallback(() => {
+    if (pendingPermission) {
+      pendingPermission.resolve('no');
+      setPendingPermission(null);
+    }
+  }, [pendingPermission]);
+
+  const onAlwaysApprove = useCallback(() => {
+    if (pendingPermission) {
+      pendingPermission.resolve('always');
+      setPendingPermission(null);
+    }
+  }, [pendingPermission]);
+
+  const onFeedbackTools = useCallback((text: string) => {
+    if (pendingPermission) {
+      pendingPermission.resolve({ type: 'feedback', text });
+      setPendingPermission(null);
+    }
+  }, [pendingPermission]);
+
   const getRuntimeState = useCallback(() => ({
     tokens,
     cost,
@@ -818,7 +885,8 @@ export function ChatUIController() {
     usage,
     provider,
     isGenerating,
-  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating]);
+    pendingPermission,
+  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission]);
 
   const ready = useMemo(() => Boolean(model), [model]);
 
@@ -843,6 +911,10 @@ export function ChatUIController() {
         onRegenerateLast={onRegenerateLast}
         onTogglePinLast={onTogglePinLast}
         onReactLast={onReactLast}
+        onApproveTools={onApproveTools}
+        onDenyTools={onDenyTools}
+        onAlwaysApprove={onAlwaysApprove}
+        onFeedbackTools={onFeedbackTools}
         getRuntimeState={getRuntimeState}
       />
     </ThemeProvider>

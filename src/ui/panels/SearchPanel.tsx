@@ -3,7 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import SelectInput from 'ink-select-input';
 import { Modal } from './Modal.js';
-import type { UIMessage } from '../types.js';
+import { type UIMessage, getTextFromContent } from '../types.js';
 
 export function SearchPanel(props: {
   messages: UIMessage[];
@@ -35,7 +35,7 @@ export function SearchPanel(props: {
     const out: UIMessage[] = [];
     for (let i = props.messages.length - 1; i >= 0; i--) {
       const m = props.messages[i];
-      const hay = `${m.role} ${m.content}`.toLowerCase();
+      const hay = `${m.role} ${getTextFromContent(m.content)}`.toLowerCase();
       if (hay.includes(query)) out.push(m);
       if (out.length >= 20) break;
     }
@@ -46,7 +46,7 @@ export function SearchPanel(props: {
   const safeIndex = results.length ? Math.min(selectedIndex, results.length - 1) : 0;
 
   const items = results.map((m) => ({
-    label: `${m.role}: ${m.content.replace(/\n/g, ' ').slice(0, 80)}`,
+    label: `${m.role}: ${getTextFromContent(m.content).replace(/\n/g, ' ').slice(0, 80)}`,
     value: m.id,
   }));
 

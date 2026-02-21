@@ -17,6 +17,7 @@ export interface WorkspaceConfig {
   version: string;
   localModels?: LocalModel[];        // Array of configured local models
   defaultLocalModel?: string;        // ID of default local model
+  autonomyMode?: 'interactive' | 'trusted' | 'on-failure'; // Agent autonomy mode
 }
 
 export class ConfigService {

@@ -1,9 +1,13 @@
 export type Role = 'user' | 'assistant' | 'system';
 
+export type ContentBlock = 
+  | { type: 'text', text: string }
+  | { type: 'diff', path: string, diffText: string, language: string };
+
 export interface UIMessage {
   id: string;
   role: Role;
-  content: string;
+  content: ContentBlock[];
   timestamp: string;
   pinned?: boolean;
   reactions?: Array<'up' | 'down'>;
@@ -32,4 +36,10 @@ export interface FileDiff {
   insertions: number;
   deletions: number;
   toolRunId?: string;
+}
+
+export function getTextFromContent(content: UIMessage['content']): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content);
+  return content.map(block => block.type === 'text' ? block.text : '').join('\n');
 }

@@ -1,12 +1,23 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { UIMessage } from './types.js';
+import type { UIMessage, ContentBlock } from './types.js';
 import { useTheme } from './Theme.js';
+import { InlineDiffView } from './InlineDiffView.js';
 
 function roleLabel(theme: ReturnType<typeof useTheme>, role: UIMessage['role']) {
   if (role === 'user') return { label: 'You', color: theme.user as any };
   if (role === 'assistant') return { label: 'Optimus', color: theme.assistant as any };
   return { label: 'System', color: theme.dim as any };
+}
+
+function renderContent(block: ContentBlock) {
+  if (block.type === 'text') {
+    return <Text>{block.text}</Text>;
+  }
+  if (block.type === 'diff') {
+    return <InlineDiffView path={block.path} diffText={block.diffText} language={block.language} />;
+  }
+  return null;
 }
 
 export function MessageList(props: {
@@ -38,7 +49,11 @@ export function MessageList(props: {
               <Text dimColor>{reactions}</Text>
               {m.editedAt ? <Text dimColor>{'  (edited)'}</Text> : null}
             </Text>
-            <Text>{typeof m.content === 'string' ? m.content : String((m as any).content)}</Text>
+            {m.content.map((block, i) => (
+              <Box key={i} flexDirection="column">
+                {renderContent(block)}
+              </Box>
+            ))}
           </Box>
         );
       })}
