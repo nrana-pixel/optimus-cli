@@ -17,7 +17,11 @@ import { renderUnifiedDiff } from '../utils/diff-viewer.js';
 
 // ─── ANSI / terminal helpers ─────────────────────────────────────────────────
 
-const o = (s: string) => process.stdout.write(s);
+export let isInkMode = false;
+
+const o = (s: string) => {
+  if (!isInkMode) process.stdout.write(s);
+};
 
 const A = {
   r:   '\x1b[0m',
@@ -70,370 +74,7 @@ const CMDS = [
   { cmd: '/exit',       args: '',           desc: 'Quit (also Ctrl+C)'                             },
 ];
 
-// ─── Spinner ─────────────────────────────────────────────────────────────────
-
-class Spinner {
-  private static FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-  private frame = 0;
-  private timer: NodeJS.Timeout | null = null;
-  private label: string;
-
-  constructor(label = 'generating') { this.label = label; }
-
-  start() {
-    this.frame = 0;
-    this._tick();
-    this.timer = setInterval(() => this._tick(), 80);
-  }
-
-  private _tick() {
-    const spin = Spinner.FRAMES[this.frame++ % Spinner.FRAMES.length];
-    o(`\r${A.cl}  ${p(A.mg, spin)} ${p(A.gy, this.label + '…')}`);
-  }
-
-  stop(label = 'optimus') {
-    if (!this.timer) return;
-    clearInterval(this.timer);
-    this.timer = null;
-    o('\r' + A.cl);
-    o(p(A.mg + A.b, label) + p(A.gy, ' ─ ') + A.r);
-  }
-
-  static notify(msg: string) {
-    o('\r' + A.cl + p(A.gy, msg) + '\n');
-  }
-}
-
-// ─── Prompt with live dropdown autocomplete ───────────────────────────────────
-
-class Prompt {
-  private buf      = '';
-  private pos      = 0;
-  private hist:    string[] = [];
-  private histIdx  = -1;
-  private histBuf  = '';
-
-  // ── Dropdown state ──────────────────────────────────────────────────────────
-  private ddItems: typeof CMDS = [];   // current filtered set
-  private ddSel   = 0;                 // currently highlighted row (0-based)
-  private ddOpen  = false;             // is dropdown visible?
-  private cursorVisualRow = 0;         // Tracks vertical cursor offset relative to the start of prompt
-
-  // Prefix "  ❯ " = 4 printable chars
-  private static readonly PFX = 4;
-  // Max rows shown in dropdown
-  private static readonly MAX_DD = 16;
-
-  constructor(
-    private onLine: (line: string) => Promise<void>,
-    private onExit: () => void,
-  ) {}
-
-  show() {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
-    this._redraw();
-    process.stdin.on('data', (k: string) => void this._key(k));
-  }
-
-  // ── Rendering ─────────────────────────────────────────────────────────────
-
-  /**
-   * INVARIANT: cursor is on the INPUT LINE when _redraw() is called,
-   *            and cursor is on the INPUT LINE when _redraw() returns.
-   *
-   * The dropdown lives BELOW the input line:
-   *   [input line]   ← cursor
-   *   [dd row 0]
-   *   [dd row 1]
-   *   …
-   *
-   * To erase: walk DOWN through each old row (\n\r\x1b[2K), then walk back UP.
-   * Never go above the input line — that caused the ghost copies.
-   */
-  private _redraw() {
-    const cols = process.stdout.columns || 80;
-
-    // ── 1. Erase old render by moving up to start of prompt and clearing down ──
-    if (this.cursorVisualRow > 0) {
-      o(A.up(this.cursorVisualRow));
-    }
-    o('\r' + A.cd);
-
-    // ── 2. Draw the prompt line by line ──────────────────────────────────────
-    const pfxStr = p(A.mg + A.b, '  ❯') + ' ';
-    const firstLineLen = cols - Prompt.PFX;
-    
-    let remaining = this.buf;
-    const linesToDraw: string[] = [];
-    
-    // First line (shorter due to prefix)
-    linesToDraw.push(remaining.slice(0, Math.max(0, firstLineLen)));
-    remaining = remaining.slice(Math.max(0, firstLineLen));
-    
-    // Subsequent lines
-    while (remaining.length > 0) {
-      linesToDraw.push(remaining.slice(0, cols));
-      remaining = remaining.slice(cols);
-    }
-    
-    for (let i = 0; i < linesToDraw.length; i++) {
-      if (i === 0) o(pfxStr + linesToDraw[i]);
-      else o('\n\r' + linesToDraw[i]);
-    }
-    
-    const promptLines = linesToDraw.length;
-
-    // ── 3. Draw the dropdown ─────────────────────────────────────────────────
-    let newDdLines = 0;
-    if (this.ddOpen && this.ddItems.length > 0) {
-      const visible  = this.ddItems.slice(0, Prompt.MAX_DD);
-      for (let i = 0; i < visible.length; i++) {
-        const item       = visible[i];
-        const isSelected = i === this.ddSel;
-        const rawMk = isSelected ? '  ▸ ' : '    ';
-        const rawCm = item.cmd.padEnd(14);
-        const rawDs = item.desc;
-
-        const mk = isSelected ? p(A.mg + A.b, rawMk) : rawMk;
-        const cm = isSelected ? p(A.mg + A.b, rawCm) : p(A.gy, rawCm);
-        const ds = isSelected ? p(A.wh, rawDs)        : p(A.gy + A.d, rawDs);
-
-        o('\n\r' + A.cl + mk + cm + ds);
-        newDdLines++;
-      }
-
-      if (this.ddItems.length > Prompt.MAX_DD) {
-        o('\n\r' + A.cl + p(A.gy, `    + ${this.ddItems.length - Prompt.MAX_DD} more`));
-        newDdLines++;
-      }
-    }
-
-    // ── 4. Position cursor at correct row and col ────────────────────────────
-    let targetRow = 0;
-    let targetCol = Prompt.PFX + this.pos;
-    if (targetCol >= cols) {
-      const rem = targetCol - cols;
-      targetRow = 1 + Math.floor(rem / cols);
-      targetCol = rem % cols;
-    }
-    
-    this.cursorVisualRow = targetRow;
-    
-    const currentPhysicalRow = (promptLines - 1) + newDdLines;
-    const upDistance = currentPhysicalRow - targetRow;
-    
-    if (upDistance > 0) o(A.up(upDistance));
-    o('\r');
-    if (targetCol > 0) o(A.col(targetCol + 1)); // VT100 columns are 1-indexed
-  }
-
-  /** Erase dropdown rows (walk down then back up), reset state. */
-  private _closeDropdown() {
-    this.ddOpen  = false;
-    this.ddItems = [];
-    this.ddSel   = 0;
-    this._redraw();
-  }
-
-  /** Update dropdown filter based on current buf */
-  private _updateDropdown() {
-    if (this.buf.startsWith('/')) {
-      const parts = this.buf.split(' ');
-      const typed = parts[0];
-      const hasArgs = parts.length > 1; // user typed a space → entering arguments
-
-      // If the typed command exactly matches one entry and user is entering args, close dropdown
-      const exactMatch = CMDS.some(c => c.cmd === typed);
-      if (exactMatch && hasArgs) {
-        this.ddOpen  = false;
-        this.ddItems = [];
-        this.ddSel   = 0;
-      } else {
-        this.ddItems = CMDS.filter(c => c.cmd.startsWith(typed));
-        this.ddOpen  = this.ddItems.length > 0;
-        if (this.ddSel >= this.ddItems.length) this.ddSel = 0;
-      }
-    } else {
-      this.ddOpen  = false;
-      this.ddItems = [];
-      this.ddSel   = 0;
-    }
-  }
-
-  // ── Key handler ─────────────────────────────────────────────────────────
-
-  private async _key(k: string) {
-
-    // ── Ctrl shortcuts ─────────────────────────────────────────────
-    if (k === '\u0003') { this._closeDropdown(); o('\n'); this.onExit(); return; }
-    if (k === '\u000c') { this._ctrlL(); return; }
-    if (k === '\u0017') { this._ctrlW(); return; }
-    if (k === '\u0001') { this.pos = 0;                this._redraw(); return; }
-    if (k === '\u0005') { this.pos = this.buf.length;  this._redraw(); return; }
-
-    // ── Enter ──────────────────────────────────────────────────────
-    if (k === '\r' || k === '\n') {
-      // If dropdown is open and user presses Enter → accept highlighted suggestion
-      if (this.ddOpen && this.ddItems.length > 0) {
-        const chosen = this.ddItems[this.ddSel].cmd;
-        this._closeDropdown();
-        this.buf = chosen;
-        this.pos = chosen.length;
-        this._redraw();
-        return;
-      }
-
-      const line = this.buf.trim();
-      this._closeDropdown();
-      
-      // Move to the bottom of the prompt to avoid overwriting it
-      const cols = process.stdout.columns || 80;
-      let targetRow = 0;
-      let targetCol = Prompt.PFX + this.buf.length;
-      if (targetCol >= cols) {
-        targetRow = 1 + Math.floor((targetCol - cols) / cols);
-      }
-      const downRem = targetRow - this.cursorVisualRow;
-      if (downRem > 0) o(A.dn(downRem));
-
-      o('\n');
-      this.histIdx = -1; this.histBuf = '';
-      this.buf = ''; this.pos = 0;
-      this.cursorVisualRow = 0;
-      if (!line) { this._redraw(); return; }
-      this.hist.push(line);
-      process.stdin.pause();
-      await this.onLine(line);
-      process.stdin.resume();
-      this._redraw();
-      return;
-    }
-
-    // ── Escape: close dropdown (keep buf) ─────────────────────────────────
-    if (k === '\x1b') {
-      if (this.ddOpen) this._closeDropdown();
-      return;
-    }
-
-    // ── Arrow keys ────────────────────────────────────────────────
-    if (k === '\x1b[A') {   // Up
-      if (this.ddOpen && this.ddItems.length > 0) {
-        this.ddSel = (this.ddSel - 1 + Math.min(this.ddItems.length, Prompt.MAX_DD)) % Math.min(this.ddItems.length, Prompt.MAX_DD);
-        this._redraw();
-      } else {
-        this._histUp();
-      }
-      return;
-    }
-    if (k === '\x1b[B') {  // Down
-      if (this.ddOpen && this.ddItems.length > 0) {
-        this.ddSel = (this.ddSel + 1) % Math.min(this.ddItems.length, Prompt.MAX_DD);
-        this._redraw();
-      } else {
-        this._histDown();
-      }
-      return;
-    }
-    if (k === '\x1b[D') {  // Left
-      if (this.pos > 0) { this.pos--; this._updateDropdown(); this._redraw(); }
-      return;
-    }
-    if (k === '\x1b[C') {  // Right
-      if (this.pos < this.buf.length) { this.pos++; this._updateDropdown(); this._redraw(); }
-      return;
-    }
-    if (k === '\x1b[H' || k === '\x1b[1~') { this.pos = 0;               this._redraw(); return; }
-    if (k === '\x1b[F' || k === '\x1b[4~') { this.pos = this.buf.length;  this._redraw(); return; }
-
-    // ── Tab: accept top suggestion ─────────────────────────────────
-    if (k === '\t') {
-      if (this.ddOpen && this.ddItems.length > 0) {
-        const chosen = this.ddItems[this.ddSel].cmd;
-        this._closeDropdown();
-        this.buf = chosen;
-        this.pos = chosen.length;
-        this._updateDropdown();
-        this._redraw();
-      }
-      return;
-    }
-
-    // ── Delete (forward) ──────────────────────────────────────────
-    if (k === '\x1b[3~') {
-      if (this.pos < this.buf.length) {
-        this.buf = this.buf.slice(0, this.pos) + this.buf.slice(this.pos + 1);
-        this._updateDropdown(); this._redraw();
-      }
-      return;
-    }
-
-    // ── Backspace ─────────────────────────────────────────────────
-    if (k === '\x7f') {
-      if (this.pos > 0) {
-        this.buf = this.buf.slice(0, this.pos - 1) + this.buf.slice(this.pos);
-        this.pos--;
-        this._updateDropdown(); this._redraw();
-      }
-      return;
-    }
-
-    // ── Printable single char ──────────────────────────────────────
-    if (k.length === 1 && k.charCodeAt(0) >= 32) {
-      this.buf = this.buf.slice(0, this.pos) + k + this.buf.slice(this.pos);
-      this.pos++;
-      this._updateDropdown(); this._redraw();
-      return;
-    }
-
-    // ── Paste (printable multi-char chunk) ────────────────────────
-    if (k.length > 1 && !k.startsWith('\x1b')) {
-      const printable = k.replace(/[^\x20-\x7e\u00a0-\uffff]/g, '');
-      if (printable) {
-        this.buf = this.buf.slice(0, this.pos) + printable + this.buf.slice(this.pos);
-        this.pos += printable.length;
-        this._updateDropdown(); this._redraw();
-      }
-    }
-  }
-
-  // ── History ──────────────────────────────────────────────────────
-
-  private _histUp() {
-    if (!this.hist.length) return;
-    if (this.histIdx === -1) { this.histBuf = this.buf; this.histIdx = this.hist.length - 1; }
-    else if (this.histIdx > 0) this.histIdx--;
-    this.buf = this.hist[this.histIdx]; this.pos = this.buf.length;
-    this._updateDropdown(); this._redraw();
-  }
-
-  private _histDown() {
-    if (this.histIdx === -1) return;
-    if (this.histIdx < this.hist.length - 1) { this.histIdx++; this.buf = this.hist[this.histIdx]; }
-    else { this.histIdx = -1; this.buf = this.histBuf; }
-    this.pos = this.buf.length;
-    this._updateDropdown(); this._redraw();
-  }
-
-  // ── Ctrl helpers ─────────────────────────────────────────────────
-
-  private _ctrlW() {
-    if (this.pos === 0) return;
-    let i = this.pos - 1;
-    while (i > 0 && this.buf[i - 1] === ' ') i--;
-    while (i > 0 && this.buf[i - 1] !== ' ') i--;
-    this.buf = this.buf.slice(0, i) + this.buf.slice(this.pos);
-    this.pos = i;
-    this._updateDropdown(); this._redraw();
-  }
-
-  private _ctrlL() {
-    o('\x1b[2J\x1b[H');
-    this.cursorVisualRow = 0;
-    this._redraw();
-  }
-}
+// ─── Chat Command ─────────────────────────────────────────────────────────────
 
 // ─── Chat Command ─────────────────────────────────────────────────────────────
 
@@ -546,6 +187,7 @@ export default class Chat extends Command {
 
   /** Read a single line from stdin (raw mode, blocking). Used only for auto-init. */
   private _readLineRaw(prompt: string): Promise<string> {
+    if (isInkMode) return Promise.resolve('');
     return new Promise((resolve) => {
       o(prompt);
       let buf = '';
@@ -575,7 +217,7 @@ export default class Chat extends Command {
         if (stats.files > 0 || this.repoMap === '') {
           this.repoMap = this.indexService.generateRepoMap();
           // Only notify if the prompt is not actively receiving input
-          Spinner.notify(`  🗂  Index ready — ${stats.files + stats.skipped} files, ${stats.symbols} new symbols`);
+          // Spinner.notify(`  🗂  Index ready — ${stats.files + stats.skipped} files, ${stats.symbols} new symbols`);
         }
       } catch (err: any) {
         // Non-fatal — just skip indexing silently
@@ -654,6 +296,7 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
   // ─── Ask the LLM ────────────────────────────────────────────────────────────
 
   private _renderStickyHeader() {
+    if (isInkMode) return;
     stickyLayout.renderHeader({
       model: this.localModelMeta ? `⚡ ${this.localModelMeta.name}` : this.llm.getModel(),
       tokens: this.tokens,
@@ -670,6 +313,10 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
 
   /** Initialize chat engine without starting legacy prompt loop */
   async _initForInkUI(hooks: NonNullable<Chat['inkHooks']>) {
+    isInkMode = true;
+    if (typeof toolExecutorUI.disable === 'function') {
+      toolExecutorUI.disable();
+    }
     this.inkHooks = hooks;
     this.llm = new LLMServiceLiteLLM();
 
@@ -770,6 +417,14 @@ Be extremely concise. Do NOT explain. Do NOT write code. Just a bullet-point pla
     this.msgs.push({ role: 'user', content: payloadContent });
     this.conv.addMessage('user', payloadContent);
 
+    if (isInkMode && this.inkHooks) {
+      this.inkHooks.onMessage({
+        role: 'user',
+        content: payloadContent,
+        id: `msg-${Date.now()}-user`
+      });
+    }
+
     // ── Planner Agent: silently expand vague queries before main LLM call ──
     // Run BEFORE the spinner so it's transparent to the user.
     // Only fires for short/vague text queries when repo map is ready.
@@ -785,10 +440,6 @@ ${plan}`,
       }
     }
 
-    const spinner = new Spinner();
-    o('\n');
-    spinner.start();
-
     let fullFinal = '';
     let started   = false;
 
@@ -800,7 +451,7 @@ ${plan}`,
       : 'Optimus';
 
     const firstContent = (label?: string) => {
-      if (!started) { started = true; spinner.stop(label ?? modelLabel); }
+      if (!started) { started = true; }
     };
 
     // ── Route through LOCAL model if connected ──────────────────────────────
@@ -827,6 +478,9 @@ ${plan}`,
         o(rendered + '\n');
         this.msgs.push({ role: 'assistant', content: fullFinal });
         this.conv.addMessage('assistant', fullFinal);
+        if (isInkMode && this.inkHooks) {
+          this.inkHooks.onMessage({ role: 'assistant', content: fullFinal, id: `msg-${Date.now()}` });
+        }
         this.conv.updateMetadata(0, 0);
         this.conv.saveSession();
         this._statusLine();
@@ -951,47 +605,15 @@ ${plan}`,
 
           // ── Check if this is an MCP tool ──
           if (this.mcpService.isMCPTool(call.name)) {
-            Spinner.notify(`  🔌 MCP: ${call.name}`);
-            const ts = new Spinner('Running');
-            ts.start(); started = false;
             const mcpResult = await this.mcpService.callTool(call.name, call.args as Record<string, unknown>);
-            ts.stop('Optimus');
             const body = mcpResult.isError ? `ERROR: ${mcpResult.content}` : mcpResult.content;
             resultParts.push(`<tool_result>\n<name>${call.name}</name>\n<output>\n${body}\n</output>\n</tool_result>`);
-            o(p(A.gy, `  ❖ [${mcpResult.serverName}] ${mcpResult.content.slice(0, 120)}\n`));
             continue;
           }
 
           // ── Built-in tool ──
-          if (call.name === 'run_command') {
-            Spinner.notify(`  🔧 ${call.name}(${argHint})`);
-            
-            // Interactive Terminal Confirmation
-            const ans = await this._readLineRaw(`\n  Optimus wants to run: ${p(A.wh + A.b, call.args.command)}\n  Allow? [Y/n]: `);
-            if (ans.trim().toLowerCase() === 'n') {
-              resultParts.push(ToolsService.formatToolResult({name: 'run_command', args: call.args, output: '', error: 'User denied permission to run this command.', durationMs: 0}));
-              o(p(A.re, `  ⚠  Command denied by user.\n`));
-              continue;
-            }
-          } else if (call.name === 'write_file') {
-            Spinner.notify(`  ✏  write_file → ${call.args.path ?? '?'}`);
-          } else if (call.name === 'edit_file') {
-            Spinner.notify(`  ✂  edit_file → ${call.args.path ?? '?'}`);
-          } else if (call.name.startsWith('git_')) {
-            Spinner.notify(`  📦 ${call.name}${argHint ? `(${argHint})` : ''}`);
-          } else {
-            Spinner.notify(`  🔧 ${call.name}(${argHint})`);
-          }
-          toolExecutorUI.start(`Running ${call.name}${argHint ? ` (${argHint})` : ''}`);
           const result = await tools.execute(call);
-          if (result.error) toolExecutorUI.fail(`${call.name} failed`);
-          else toolExecutorUI.succeed(`${call.name} complete`);
           resultParts.push(ToolsService.formatToolResult(result));
-          if (call.name !== 'write_file' && call.name !== 'edit_file') {
-            o(p(A.gy, `  ❖ ${(result.output || result.error || '').slice(0, 120)}\n`));
-          } else if (result.error) {
-            o(p(A.re, `  ⚠  ${result.error.slice(0, 120)}\n`));
-          }
         }
 
         msgs.push({ role: 'user', content: resultParts.join('\n\n') + '\n\nContinue with your response.' });
@@ -1061,6 +683,9 @@ ${plan}`,
 
       this.msgs.push({ role: 'assistant', content: saveString });
       this.conv.addMessage('assistant', saveString, { tokensDelta: turnDeltaTokens, costDelta: turnDeltaCost });
+      if (isInkMode && this.inkHooks) {
+        this.inkHooks.onMessage({ role: 'assistant', content: saveString, id: `msg-${Date.now()}` });
+      }
       this.conv.updateMetadata(this.tokens, this.cost);
       this.conv.saveSession();
       this._statusLine();
@@ -1352,8 +977,6 @@ ${plan}`,
         }
 
         // ── Single spinner for whole detection phase ──────────────────────────
-        const detectSpinner = new Spinner('Connecting');
-        detectSpinner.start();
         const t0 = Date.now();
 
         // 1. Probe Ollama (GET /api/tags)
@@ -1401,7 +1024,6 @@ ${plan}`,
               connected   = true;
             }
           } catch (err) {
-            detectSpinner.stop('Optimus');
             o('\n');
             o(p(A.re, `  ✖ Cannot reach ${p(A.wh, endpoint)}\n`));
             o(p(A.gy, `     ${err instanceof Error ? err.message : String(err)}\n`));
@@ -1410,7 +1032,6 @@ ${plan}`,
           }
         }
 
-        detectSpinner.stop('Optimus');
         o('\n');
 
         if (!connected) {
@@ -1605,14 +1226,10 @@ ${plan}`,
         MCPService.addServer(newCfg);
         o(p(A.gr + A.b, `  ✔ MCP server "${serverName}" configured.\n`));
 
-        const ts = new Spinner('Connecting');
-        ts.start();
         try {
           const discovered = await this.mcpService.connectToServer(newCfg);
-          ts.stop('Optimus');
           o(p(A.gr + A.b, `  🔌 Connected! Discovered ${discovered.length} tool(s).\n`));
         } catch (e: any) {
-          ts.stop('Optimus');
           o(p(A.re, `  ⚠  Saved configuration, but failed to connect:\n  ${e.message}\n`));
         }
         break;
@@ -1641,16 +1258,11 @@ ${plan}`,
         if (!this.indexService) {
           this.indexService = new IndexService(resolve('.'));
         }
-
-        // Check for --embed flag
         const doEmbed = rest.includes('--embed');
 
-        const ts = new Spinner('Indexing');
-        ts.start();
         try {
           const stats = await this.indexService.buildIndex();
           this.repoMap = this.indexService.generateRepoMap();
-          ts.stop('Optimus');
           const dbStats = this.indexService.getStats();
           o('\n');
           const W = 54, HR = '─'.repeat(W);
@@ -1683,7 +1295,6 @@ ${plan}`,
             o(p(A.gy, '  Tip: Run /index --embed to enable semantic search.\n'));
           }
         } catch (e: any) {
-          ts.stop('Optimus');
           o(p(A.re, `  ⚠  Indexing failed: ${e.message}\n`));
         }
         break;
@@ -1725,11 +1336,8 @@ ${plan}`,
           break;
         }
 
-        const ts2 = new Spinner('Searching');
-        ts2.start();
         try {
           const results = await this.indexService.semanticSearch(query, embedFn, 5);
-          ts2.stop('Optimus');
           o('\n');
           if (results.length === 0) {
             o(p(A.ye, '  ⚠  No results. Run /index --embed first to build embeddings.\n'));
@@ -1742,7 +1350,6 @@ ${plan}`,
             o(p(A.gy, '  ' + preview.replace(/\n/g, '\n  ') + '\n\n'));
           }
         } catch (e: any) {
-          ts2.stop('Optimus');
           o(p(A.re, `  ⚠  Semantic search failed: ${e.message}\n`));
         }
         break;
@@ -1753,6 +1360,17 @@ ${plan}`,
         o(p(A.gy, '  Type /help or press / to see all commands.\n'));
     }
     o('\n');
+
+    if (isInkMode && this.inkHooks) {
+      this.inkHooks.onState({
+        tokens: this.tokens,
+        cost: this.cost,
+        model: this.localModelMeta ? `⚡ ${this.localModelMeta.name}` : this.llm.getModel(),
+        sessionName: this.sessName,
+        toolsEnabled: this.toolsEnabled,
+        planMode: this.planMode,
+      });
+    }
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -4,11 +4,11 @@ import { Modal } from './Modal.js';
 
 export function HelpOverlayPanel(props: { onClose: () => void }) {
   useInput((ch, key) => {
-    if (key.escape) props.onClose();
+    if (key.escape || ch === '?') props.onClose();
   });
 
   return (
-    <Modal title="Help" footer="Esc closes">
+    <Modal title="Help" footer="Esc or ? closes">
       <Box flexDirection="column">
         <Text bold>Navigation</Text>
         <Text dimColor>- / : command palette</Text>

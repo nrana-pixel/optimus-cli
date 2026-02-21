@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState, useEffect } from 'react';
-import { Box, Text, useApp, useInput } from 'ink';
+import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import type { UIMessage, ToolRun, FileDiff } from './types.js';
-import { StickyHeader } from './StickyHeader.js';
+
 import { MessageList } from './MessageList.js';
 import { SearchPanel } from './panels/SearchPanel.js';
 import { ExportPanel } from './panels/ExportPanel.js';
@@ -63,8 +63,20 @@ export interface ChatAppProps {
     recentCommands: string[];
     usage: Record<string, number>;
     provider: string;
+    isGenerating: boolean;
   };
 }
+function getMessageHeight(m: UIMessage, columns: number, compactMode: boolean): number {
+  let lines = 1; // header
+  const textLines = (m.content || '').split('\n');
+  for (const line of textLines) {
+    if (line.length === 0) lines += 1;
+    else lines += Math.ceil(line.length / columns);
+  }
+  if (!compactMode) lines += 1;
+  return lines;
+}
+
 
 export function ChatApp(props: ChatAppProps) {
   const { exit } = useApp();
@@ -83,12 +95,20 @@ export function ChatApp(props: ChatAppProps) {
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
   const [searchAllOpen, setSearchAllOpen] = useState(false);
   const [scrollOffset, setScrollOffset] = useState(0); // 0 = bottom/newest
-  const WINDOW = useMemo(() => {
-    const rows = (process.stdout as any)?.rows ?? 40;
-    // header + status + input + margins
-    const usable = Math.max(10, rows - 12);
-    return Math.max(40, Math.min(250, usable));
-  }, []);
+
+  const { stdout } = useStdout();
+  const [height, setHeight] = useState(stdout.rows);
+
+  useEffect(() => {
+    const onResize = () => setHeight(stdout.rows);
+    stdout.on('resize', onResize);
+    return () => {
+      stdout.off('resize', onResize);
+    };
+  }, [stdout]);
+
+  const usableHeight = Math.max(10, height - 15);
+  const columns = (process.stdout as any)?.columns ?? 80;
   const [page, setPage] = useState(0); // deprecated, kept for compatibility but unused
   const [anchorMessageId, setAnchorMessageId] = useState<string | null>(null);
   const [returnState, setReturnState] = useState<null | { scrollOffset: number; threadRootId: string | null; threadLeafId: string | null }>(null);
@@ -126,39 +146,7 @@ export function ChatApp(props: ChatAppProps) {
   }, [state.savedThreadRootId, state.savedThreadLeafId]);
 
   const hint = useMemo(() => {
-    return [
-      'Enter send',
-      'Ctrl+C quit',
-      '/ palette',
-      'Ctrl+R regen',
-      'Ctrl+P pin',
-      'Ctrl+U 👍',
-      'Ctrl+D 👎',
-      'Esc close palette',
-      'Ctrl+F search',
-      'Ctrl+Shift+N/P next/prev hit',
-      'Ctrl+E export',
-      'Ctrl+, settings',
-      'PgUp/PgDn scroll',
-      '↑/↓ scroll',
-'Ctrl+HomeTop(Ctrl+A) / Bottom(Ctrl+E)',
-      'Ctrl+S sessions',
-      'Ctrl+B pins',
-      'Ctrl+G global search',
-      'Ctrl+I insights',
-      'Ctrl+T thread',
-      'Ctrl+L all',
-      'Ctrl+M branches',
-      'Ctrl+Y diffs',
-      'Ctrl+K edit msg',
-      'Ctrl+J siblings',
-      'Ctrl+U tags',
-      'Ctrl+Del delete',
-      'Ctrl+H edit asst',
-      'Ctrl+P prune branch',
-      'Ctrl+O map',
-      'Ctrl+N import',
-    ].join('  ·  ');
+    return 'Shortcuts: Press "Esc" to close overlays, Ctrl+C to exit.';
   }, []);
 
   const submit = useCallback(async () => {
@@ -168,6 +156,8 @@ export function ChatApp(props: ChatAppProps) {
     setAnchorMessageId(null);
     await props.onSubmit(v);
   }, [input, props]);
+
+  const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || toolRunsOpen || diffReviewOpen || siblingsOpen || tagOpen || editAssistantOpen || deleteMsgOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen;
 
   useInput(async (ch, key) => {
     if (key.ctrl && ch === 'c') exit();
@@ -232,7 +222,6 @@ export function ChatApp(props: ChatAppProps) {
     if (seq === '\u001BOP' || seq === '\u001B[11~' || seq === '\u001B[1;2P') setHelpOpen(true);
 
     // virtualization scroll
-    const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen;
     if (!anyModal) {
       if (key.upArrow) {
         setAnchorMessageId(null);
@@ -244,11 +233,11 @@ export function ChatApp(props: ChatAppProps) {
       }
       if (key.pageUp) {
         setAnchorMessageId(null);
-        setScrollOffset((o) => Math.min(o + WINDOW, 5000));
+        setScrollOffset((o) => Math.min(o + 20, 5000));
       }
       if (key.pageDown) {
         setAnchorMessageId(null);
-        setScrollOffset((o) => Math.max(o - WINDOW, 0));
+        setScrollOffset((o) => Math.max(o - 20, 0));
       }
       // top/bottom
       if (key.ctrl && ch === 'a') {
@@ -309,75 +298,119 @@ export function ChatApp(props: ChatAppProps) {
   ];
 
   return (
-    <Box flexDirection="column">
-      <StickyHeader
-        model={props.model}
-        sessionName={props.sessionName}
-        toolsEnabled={state.toolsEnabled}
-        planMode={state.planMode}
-        tokens={state.tokens}
-        cost={state.cost}
-        tokenLimit={props.tokenLimit}
-        toolsRunning={state.tools.filter((t) => t.status === 'running').length}
-      />
+    <Box flexDirection="column" height={height} overflow="hidden">
 
       {anchorMessageId ? (
-        <Box borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1}>
+        <Box borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1} display={anyModal ? 'none' : 'flex'}>
           <Text dimColor>
             Jumped to a search hit. Ctrl+Z to return. Ctrl+Shift+N/P to cycle hits.
           </Text>
         </Box>
       ) : null}
 
-      {(() => {
-        const allMessages = state.messages;
+      <Box flexDirection="column" display={anyModal ? 'none' : 'flex'}>
+        {(() => {
+          const allMessages = state.messages;
 
-        // thread view: show only messages in the path ending at threadRootId
-        const viewMessages = (() => {
-          if (!threadRootId) return allMessages;
-          const byId = new Map(allMessages.map((m) => [m.id, m]));
+          // thread view: show only messages in the path ending at threadRootId
+          const viewMessages = (() => {
+            if (!threadRootId) return allMessages;
+            const byId = new Map(allMessages.map((m) => [m.id, m]));
 
-          // If a leaf is selected, show parent chain up to leaf.
-          const leaf = threadLeafId ? byId.get(threadLeafId) : byId.get(threadRootId);
-          const chain: any[] = [];
-          let cur = leaf;
-          while (cur) {
-            chain.push(cur);
-            cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
+            // If a leaf is selected, show parent chain up to leaf.
+            const leaf = threadLeafId ? byId.get(threadLeafId) : byId.get(threadRootId);
+            const chain: any[] = [];
+            let cur = leaf;
+            while (cur) {
+              chain.push(cur);
+              cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
+            }
+            return chain.reverse();
+          })();
+
+          if (anchorMessageId) {
+            const idx = viewMessages.findIndex((m) => m.id === anchorMessageId);
+            if (idx >= 0) {
+              const slice: UIMessage[] = [];
+              let currentHeight = 0;
+              const anchorM = viewMessages[idx];
+              currentHeight += getMessageHeight(anchorM, columns, settings.compactMode);
+              slice.push(anchorM);
+
+              let upIdx = idx - 1;
+              let downIdx = idx + 1;
+              while (currentHeight < usableHeight && (upIdx >= 0 || downIdx < viewMessages.length)) {
+                if (upIdx >= 0) {
+                  const m = viewMessages[upIdx];
+                  const h = getMessageHeight(m, columns, settings.compactMode);
+                  if (currentHeight + h <= usableHeight) {
+                    currentHeight += h;
+                    slice.unshift(m);
+                    upIdx--;
+                  } else upIdx = -1;
+                }
+                if (currentHeight < usableHeight && downIdx < viewMessages.length) {
+                  const m = viewMessages[downIdx];
+                  const h = getMessageHeight(m, columns, settings.compactMode);
+                  if (currentHeight + h <= usableHeight) {
+                    currentHeight += h;
+                    slice.push(m);
+                    downIdx++;
+                  } else downIdx = viewMessages.length;
+                }
+              }
+              const start = upIdx + 1;
+              return (
+                <>
+                  {start === 0 && (
+                    <Box paddingX={1} paddingBottom={1} flexShrink={0}>
+                      <Text dimColor>Optimus · {props.model} · {props.sessionName}</Text>
+                    </Box>
+                  )}
+                  <MessageList
+                    messages={slice}
+                    compactMode={settings.compactMode}
+                    anchorMessageId={anchorMessageId}
+                  />
+                </>
+              );
+            }
           }
-          return chain.reverse();
-        })();
 
-        if (anchorMessageId) {
-          const idx = viewMessages.findIndex((m) => m.id === anchorMessageId);
-          if (idx >= 0) {
-            const start = Math.max(0, idx - Math.floor(WINDOW / 2));
-            const end = Math.min(viewMessages.length, start + WINDOW);
-            const slice = viewMessages.slice(start, end);
-            return (
+          const slice: UIMessage[] = [];
+          let currentHeight = 0;
+          let viewEnd = Math.max(0, viewMessages.length - scrollOffset);
+          let startIdx = viewEnd - 1;
+
+          while (startIdx >= 0) {
+            const m = viewMessages[startIdx];
+            const msgH = getMessageHeight(m, columns, settings.compactMode);
+            if (currentHeight + msgH > usableHeight && slice.length > 0) break;
+            currentHeight += msgH;
+            slice.unshift(m);
+            startIdx--;
+          }
+          const start = startIdx + 1;
+
+          return (
+            <>
+              {start === 0 && (
+                <Box paddingX={1} paddingBottom={1} flexShrink={0}>
+                  <Text dimColor>Optimus · {props.model} · {props.sessionName}</Text>
+                </Box>
+              )}
               <MessageList
                 messages={slice}
                 compactMode={settings.compactMode}
-                anchorMessageId={anchorMessageId}
+                anchorMessageId={null}
               />
-            );
-          }
-        }
+            </>
+          );
+        })()}
 
-        const end = Math.max(0, viewMessages.length - scrollOffset);
-        const start = Math.max(0, end - WINDOW);
-        const slice = viewMessages.slice(start, end);
-        return (
-          <MessageList
-            messages={slice}
-            compactMode={settings.compactMode}
-            anchorMessageId={null}
-          />
-        );
-      })()}
-
-      <ToolPanel tools={state.tools} />
-      <DiffPanel diffs={state.diffs} />
+        <ToolPanel tools={state.tools} />
+        <DiffPanel diffs={state.diffs} />
+      </Box>
 
       {paletteOpen ? (
         <CommandPalette
@@ -386,7 +419,7 @@ export function ChatApp(props: ChatAppProps) {
           onCancel={() => setPaletteOpen(false)}
           onSelect={async (cmd) => {
             setPaletteOpen(false);
-            await props.onSubmit(`/recent-cmd ${cmd}`);
+            await props.onSubmit(`/ recent - cmd ${cmd} `);
 
             // local-only commands
             if (cmd === '/search') {
@@ -497,10 +530,10 @@ export function ChatApp(props: ChatAppProps) {
 
       {exportOpen ? (
         <ExportPanel
-          defaultPath={`./${props.sessionName}.md`}
+          defaultPath={`./ ${props.sessionName}.md`}
           onClose={() => setExportOpen(false)}
           onExport={async (format, path) => {
-            await props.onSubmit(`/export-ui ${format} ${path}`);
+            await props.onSubmit(`/export -ui ${format} ${path} `);
           }}
         />
       ) : null}
@@ -511,7 +544,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setSettingsOpen(false)}
           onUpdate={async (next) => {
             setSettings(next);
-            await props.onSubmit(`/settings ${next.theme} ${next.compactMode ? 'compact' : 'normal'} ${next.showLineNumbers ? 'lines' : 'nolines'}`);
+            await props.onSubmit(`/ settings ${next.theme} ${next.compactMode ? 'compact' : 'normal'} ${next.showLineNumbers ? 'lines' : 'nolines'} `);
           }}
         />
       ) : null}
@@ -521,11 +554,11 @@ export function ChatApp(props: ChatAppProps) {
           sessions={state.sessions}
           onClose={() => setSessionsOpen(false)}
           onLoad={async (id) => {
-            await props.onSubmit(`/load-session ${id}`);
+            await props.onSubmit(`/ load - session ${id} `);
             setSessionsOpen(false);
           }}
           onDelete={async (id) => {
-            await props.onSubmit(`/delete-session ${id}`);
+            await props.onSubmit(`/ delete -session ${id} `);
           }}
         />
       ) : null}
@@ -549,7 +582,7 @@ export function ChatApp(props: ChatAppProps) {
           })()}
           onClose={() => setEditLastOpen(false)}
           onSubmit={async (newText) => {
-            await props.onSubmit(`/edit-last ${JSON.stringify(newText)}`);
+            await props.onSubmit(`/ edit - last ${JSON.stringify(newText)} `);
           }}
         />
       ) : null}
@@ -559,7 +592,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setEditMessageOpen(false)}
           onEditAndBranch={async (messageId, newContent) => {
-            await props.onSubmit(`/edit-branch ${messageId} ${JSON.stringify(newContent)}`);
+            await props.onSubmit(`/ edit - branch ${messageId} ${JSON.stringify(newContent)} `);
             setThreadRootId(messageId);
           }}
         />
@@ -583,11 +616,11 @@ export function ChatApp(props: ChatAppProps) {
           hits={state.globalHits}
           onClose={() => setSearchAllOpen(false)}
           onQuery={async (q) => {
-            const res = await props.onSubmit(`/search-all ${JSON.stringify(q)}`);
+            const res = await props.onSubmit(`/ search - all ${JSON.stringify(q)} `);
             void res;
           }}
           onSelect={async (hit) => {
-            await props.onSubmit(`/load-session ${hit.sessionId}`);
+            await props.onSubmit(`/ load - session ${hit.sessionId} `);
             setAnchorMessageId(hit.messageId);
             setSearchAllOpen(false);
           }}
@@ -600,7 +633,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setBranchOpen(false)}
           onSelectParent={async (parentId) => {
             // Start branch: controller will set a thread root and next message will reference parent
-            await props.onSubmit(`/branch ${parentId}`);
+            await props.onSubmit(`/ branch ${parentId} `);
             setThreadRootId(parentId);
           }}
         />
@@ -612,7 +645,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setBranchesOpen(false)}
           onSelectThread={async (rootId) => {
             setThreadRootId(rootId);
-            await props.onSubmit(`/thread-root ${rootId ?? ''}`);
+            await props.onSubmit(`/ thread - root ${rootId ?? ''} `);
           }}
         />
       ) : null}
@@ -634,14 +667,14 @@ export function ChatApp(props: ChatAppProps) {
           diffs={selectedToolRunId ? (state.diffGroups[selectedToolRunId] ?? []) : state.diffs}
           onClose={() => setDiffReviewOpen(false)}
           onRevertFile={async (path) => {
-            await props.onSubmit(`/revert-file ${path}`);
+            await props.onSubmit(`/ revert - file ${path} `);
           }}
           onRevertAll={async () => {
-            if (selectedToolRunId) await props.onSubmit(`/revert-run ${selectedToolRunId}`);
+            if (selectedToolRunId) await props.onSubmit(`/ revert - run ${selectedToolRunId} `);
             else await props.onSubmit('/revert-all');
           }}
           onAccept={() => {
-            if (selectedToolRunId) void props.onSubmit(`/accept-run ${selectedToolRunId}`);
+            if (selectedToolRunId) void props.onSubmit(`/ accept - run ${selectedToolRunId} `);
             else void props.onSubmit('/accept-diffs');
             setDiffReviewOpen(false);
           }}
@@ -655,7 +688,7 @@ export function ChatApp(props: ChatAppProps) {
           onClose={() => setSiblingsOpen(false)}
           onSelectChild={async (childId) => {
             setThreadLeafId(childId);
-            await props.onSubmit(`/thread-leaf ${childId}`);
+            await props.onSubmit(`/ thread - leaf ${childId} `);
           }}
         />
       ) : null}
@@ -664,8 +697,8 @@ export function ChatApp(props: ChatAppProps) {
         <TagPanel
           messages={state.messages}
           onClose={() => setTagOpen(false)}
-          onTag={async (id, tag) => props.onSubmit(`/tag-msg ${id} ${JSON.stringify(tag)}`)}
-          onUntag={async (id, tag) => props.onSubmit(`/untag-msg ${id} ${JSON.stringify(tag)}`)}
+          onTag={async (id, tag) => props.onSubmit(`/ tag - msg ${id} ${JSON.stringify(tag)} `)}
+          onUntag={async (id, tag) => props.onSubmit(`/ untag - msg ${id} ${JSON.stringify(tag)} `)}
         />
       ) : null}
 
@@ -674,7 +707,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setDeleteMsgOpen(false)}
           onDelete={async (id) => {
-            await props.onSubmit(`/delete-msg ${id}`);
+            await props.onSubmit(`/ delete -msg ${id} `);
           }}
         />
       ) : null}
@@ -684,7 +717,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setEditAssistantOpen(false)}
           onEdit={async (id, content) => {
-            await props.onSubmit(`/edit-asst ${id} ${JSON.stringify(content)}`);
+            await props.onSubmit(`/ edit - asst ${id} ${JSON.stringify(content)} `);
           }}
         />
       ) : null}
@@ -694,7 +727,7 @@ export function ChatApp(props: ChatAppProps) {
           messages={state.messages}
           onClose={() => setPruneBranchOpen(false)}
           onPrune={async (leafId) => {
-            await props.onSubmit(`/prune-branch ${leafId}`);
+            await props.onSubmit(`/ prune - branch ${leafId} `);
           }}
         />
       ) : null}
@@ -708,7 +741,7 @@ export function ChatApp(props: ChatAppProps) {
             // also set as thread root for quick thread view
             setThreadRootId(id);
             setThreadLeafId(null);
-            await props.onSubmit(`/thread-root ${id}`);
+            await props.onSubmit(`/ thread - root ${id} `);
             setBranchMapOpen(false);
           }}
         />
@@ -718,7 +751,7 @@ export function ChatApp(props: ChatAppProps) {
         <ImportSessionPanel
           onClose={() => setImportOpen(false)}
           onImport={async (p) => {
-            await props.onSubmit(`/import ${p}`);
+            await props.onSubmit(`/import ${p} `);
           }}
         />
       ) : null}
@@ -727,19 +760,27 @@ export function ChatApp(props: ChatAppProps) {
         <HelpOverlayPanel onClose={() => setHelpOpen(false)} />
       ) : null}
 
-      <Box marginTop={1}>
-        <PromptInput
-          value={input}
-          onChange={setInput}
-          onSubmit={submit}
-          disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen}
-        />
+      <Box flexDirection="column" flexShrink={0}>
+        <Box marginTop={1}>
+          <PromptInput
+            value={input}
+            onChange={(v) => {
+              if (v === '?') {
+                setHelpOpen(!helpOpen);
+                return;
+              }
+              setInput(v);
+            }}
+            onSubmit={submit}
+            disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen}
+          />
+        </Box>
+
+        <Toasts toasts={state.toasts} />
+
+        {state.isGenerating && <StatusBar hint="Generating..." isGenerating={true} />}
+        <Text dimColor>Tip: Press “?” for shortcuts. Press “/” for palette. Ctrl+R regen. Ctrl+U/Ctrl+D react.</Text>
       </Box>
-
-      <Toasts toasts={state.toasts} />
-
-      <StatusBar hint={hint} />
-      <Text dimColor>Tip: Press “/” to open palette. Ctrl+R regenerate. Ctrl+U/Ctrl+D react.</Text>
     </Box>
   );
 }

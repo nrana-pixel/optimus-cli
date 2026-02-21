@@ -3,13 +3,20 @@ import chalk from 'chalk';
 
 export class ToolExecutorUI {
   private spinner: Ora | null = null;
+  private disabled = false;
+
+  disable() {
+    this.disabled = true;
+  }
 
   start(label: string) {
+    if (this.disabled) return;
     this.stop(true);
     this.spinner = ora({ text: label, spinner: 'dots' }).start();
   }
 
   succeed(label: string) {
+    if (this.disabled) return;
     if (!this.spinner) {
       // fallback
       process.stdout.write(chalk.gray(`✔ ${label}\n`));
@@ -20,6 +27,7 @@ export class ToolExecutorUI {
   }
 
   fail(label: string) {
+    if (this.disabled) return;
     if (!this.spinner) {
       process.stdout.write(chalk.red(`✖ ${label}\n`));
       return;
@@ -29,6 +37,7 @@ export class ToolExecutorUI {
   }
 
   info(msg: string) {
+    if (this.disabled) return;
     // A transient info message (doesn't keep spinner)
     if (this.spinner) this.spinner.stop();
     process.stdout.write(chalk.gray(msg) + '\n');
@@ -36,6 +45,7 @@ export class ToolExecutorUI {
   }
 
   stop(silent = false) {
+    if (this.disabled) return;
     if (!this.spinner) return;
     if (silent) this.spinner.stop();
     else this.spinner.stop();

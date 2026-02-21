@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text } from 'ink';
 import { ChatApp } from '../ChatApp.js';
 import { ThemeProvider } from '../Theme.js';
@@ -44,6 +44,7 @@ export function ChatUIController() {
   const [provider, setProvider] = useState<string>('unknown');
   const [toolsEnabled, setToolsEnabled] = useState(true);
   const [planMode, setPlanMode] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
 
   const tokenLimit = 128_000;
 
@@ -103,7 +104,7 @@ export function ChatUIController() {
       try {
         const cfg = ConfigService.loadConfig();
         cfgProvider = String(cfg.apiProvider ?? 'unknown');
-      } catch {}
+      } catch { }
       s.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: cfgProvider };
       if (!s.settings.provider || s.settings.provider === 'unknown') s.settings.provider = cfgProvider;
       setProvider(s.settings.provider ?? 'unknown');
@@ -136,12 +137,18 @@ export function ChatUIController() {
       if (u && typeof u === 'object') setUsage(u);
       const pr = (s?.settings as any)?.provider;
       if (typeof pr === 'string') setProvider(pr);
-    } catch {}
+    } catch { }
 
     await refreshSessions();
 
     return cmd;
   }, []);
+
+  useEffect(() => {
+    ensureEngine().catch((err) => {
+      pushToast('error', err?.message ?? 'Startup failed');
+    });
+  }, [ensureEngine]);
 
   const pushToast = useCallback((type: Toast['type'], message: string) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -300,7 +307,7 @@ export function ChatUIController() {
       const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
       const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
       let tag = raw;
-      try { tag = JSON.parse(raw); } catch {}
+      try { tag = JSON.parse(raw); } catch { }
 
       const session = (cmd as any).conv.getCurrentSession();
       const msg = session?.messages.find((m: any) => m.id === messageId);
@@ -320,7 +327,7 @@ export function ChatUIController() {
       const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
       const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
       let tag = raw;
-      try { tag = JSON.parse(raw); } catch {}
+      try { tag = JSON.parse(raw); } catch { }
 
       const session = (cmd as any).conv.getCurrentSession();
       const msg = session?.messages.find((m: any) => m.id === messageId);
@@ -397,7 +404,7 @@ export function ChatUIController() {
       const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
       const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
       let newContent = raw;
-      try { newContent = JSON.parse(raw); } catch {}
+      try { newContent = JSON.parse(raw); } catch { }
 
       const session = (cmd as any).conv.getCurrentSession();
       const msg = session?.messages.find((m: any) => m.id === messageId);
@@ -419,7 +426,7 @@ export function ChatUIController() {
       const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
       const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
       let newContent = raw;
-      try { newContent = JSON.parse(raw); } catch {}
+      try { newContent = JSON.parse(raw); } catch { }
 
       const session = (cmd as any).conv.getCurrentSession();
       if (!session) return;
@@ -457,7 +464,7 @@ export function ChatUIController() {
       // edit last user message content in session and rerun
       const raw = text.replace('/edit-last', '').trim();
       let newPrompt = raw;
-      try { newPrompt = JSON.parse(raw); } catch {}
+      try { newPrompt = JSON.parse(raw); } catch { }
 
       const session = (cmd as any).conv.getCurrentSession();
       if (session) {
@@ -716,7 +723,7 @@ export function ChatUIController() {
       await incUsage('search-all');
       const raw = text.replace('/search-all', '').trim();
       let q = raw;
-      try { q = JSON.parse(raw); } catch {}
+      try { q = JSON.parse(raw); } catch { }
 
       const query = String(q).trim().toLowerCase();
       const list = (cmd as any).conv.listSessions();
@@ -744,6 +751,7 @@ export function ChatUIController() {
     }
 
     try {
+      setIsGenerating(true);
       // If we're in a branch, attach parentMessageId to the next user message at persistence level.
       if (branchParentId && !text.startsWith('/')) {
         // Add user message with parentMessageId to session + engine
@@ -757,6 +765,8 @@ export function ChatUIController() {
       }
     } catch (e: any) {
       pushToast('error', e?.message ?? 'Command failed');
+    } finally {
+      setIsGenerating(false);
     }
     await refreshSessions();
   }, [ensureEngine, refreshSessions]);
@@ -790,9 +800,14 @@ export function ChatUIController() {
 
     // Re-run: ask engine with last user content
     if (typeof lastUser.content === 'string') {
-      await (cmd as any)._handleInkLine(lastUser.content);
-      await refreshSessions();
-      pushToast('success', 'Regenerated');
+      try {
+        setIsGenerating(true);
+        await (cmd as any)._handleInkLine(lastUser.content);
+        await refreshSessions();
+        pushToast('success', 'Regenerated');
+      } finally {
+        setIsGenerating(false);
+      }
     }
   }, [ensureEngine, pushToast, refreshSessions]);
 
@@ -825,7 +840,8 @@ export function ChatUIController() {
     recentCommands,
     usage,
     provider,
-  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider]);
+    isGenerating,
+  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating]);
 
   const ready = useMemo(() => Boolean(model), [model]);
 

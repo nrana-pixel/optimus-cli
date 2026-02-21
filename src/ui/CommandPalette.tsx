@@ -95,7 +95,7 @@ export function CommandPalette(props: {
   const current = cmdRows[safeSelected]?.cmd as PaletteCommand | undefined;
 
   // scroll window over rows (not just cmds)
-  const visibleRows = 18;
+  const visibleRows = 8;
   const selectedValue = current?.value;
   const selectedRowIndex = selectedValue ? rows.findIndex((r) => r.kind === 'cmd' && r.cmd.value === selectedValue) : 0;
   const scrollStart = Math.max(0, selectedRowIndex - Math.floor(visibleRows / 2));
@@ -103,7 +103,7 @@ export function CommandPalette(props: {
 
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1}>
+    <Box flexDirection="column" borderStyle="round" borderColor={theme.accent as any} paddingX={1} marginTop={1} flexShrink={0}>
       <Text bold color={theme.accent as any}>Command Palette</Text>
       <Text color={theme.dim as any}>Type to filter · ↑/↓ select · Enter run · Esc close</Text>
       <Box marginTop={1}>
