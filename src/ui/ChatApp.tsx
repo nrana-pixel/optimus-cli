@@ -31,6 +31,7 @@ import { StatusBar } from './StatusBar.js';
 import { ToolPanel } from './ToolPanel.js';
 import { DiffPanel } from './DiffPanel.js';
 import { CommandPalette, type PaletteCommand } from './CommandPalette.js';
+import { SlashCommandOverlay } from './SlashCommandOverlay.js';
 import { Toasts } from './Toasts.js';
 import { useTheme } from './Theme.js';
 
@@ -248,6 +249,16 @@ export function ChatApp(props: ChatAppProps) {
       }
     }
     if (key.ctrl && ch === 'e') setExportOpen(true);
+
+    // Tab for autocomplete when slash overlay is visible
+    if (key.tab && input.startsWith('/') && !anyModal) {
+      const q = input.slice(1).toLowerCase();
+      const first = commands.find(c => c.value.toLowerCase().slice(1).startsWith(q));
+      if (first) {
+        setInput(first.value + ' ');
+      }
+      return;
+    }
     if (key.ctrl && ch === ',') setSettingsOpen(true);
     if (key.ctrl && (ch === 's' || ch === 'S')) setSessionsOpen(true);
     if (key.ctrl && (ch === 'b' || ch === 'B')) setPinsOpen(true);
@@ -313,6 +324,9 @@ export function ChatApp(props: ChatAppProps) {
   const commands: PaletteCommand[] = [
     { id: 'help', title: 'Help', value: '/help', description: 'Show commands and shortcuts', category: 'General' },
     { id: 'clear', title: 'Clear', value: '/clear', description: 'Clear chat history', category: 'General' },
+    { id: 'compact', title: 'Compact', value: '/compact', description: 'Summarize and truncate history', category: 'General' },
+    { id: 'review', title: 'Review', value: '/review', description: 'Review git diffs', category: 'General' },
+    { id: 'shell', title: 'Shell Escape', value: '!', description: 'Execute shell command (e.g. !ls)', category: 'General' },
     { id: 'history', title: 'History', value: '/history', description: 'Print conversation so far', category: 'General' },
     { id: 'model', title: 'Model', value: '/model', description: 'Show or change model', category: 'Config' },
     { id: 'tools', title: 'Tools', value: '/tools', description: 'Toggle tools', category: 'Agent' },
@@ -841,6 +855,9 @@ export function ChatApp(props: ChatAppProps) {
       ) : null}
 
       <Box flexDirection="column" flexShrink={0}>
+        {!anyModal && input.startsWith('/') && input.length > 1 && (
+          <SlashCommandOverlay query={input} commands={commands} />
+        )}
         <Box marginTop={1} marginX={1}>
           <PromptInput
             value={input}

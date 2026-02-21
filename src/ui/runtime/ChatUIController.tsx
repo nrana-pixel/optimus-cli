@@ -7,22 +7,17 @@ import type { Toast } from '../Toasts.js';
 import type { SessionListItem } from '../panels/SessionsPanel.js';
 import type { GlobalSearchHit } from '../panels/SearchAllPanel.js';
 
+import { readFileSync, existsSync } from 'fs';
 import { ChatEngine } from '../../chat/chat-engine.js';
 import { ConfigService } from '../../services/config.service.js';
 
 /**
  * Ink UI Controller
- *
- * To avoid duplicating all agent logic, we reuse the existing Chat command as an engine.
- * We instantiate it and call internal methods through a small adapter.
- *
- * This is intentionally pragmatic: we keep a single source of truth for agent orchestration.
  */
 export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) {
   const engineRef = useRef<ChatEngine | null>(null);
   const [initialPromptHandled, setInitialPromptHandled] = useState(false);
 
-  // UI state mirrors engine runtime state
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [tools, setTools] = useState<ToolRun[]>([]);
   const [diffs, setDiffs] = useState<FileDiff[]>([]);
@@ -46,6 +41,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const [toolsEnabled, setToolsEnabled] = useState(true);
   const [planMode, setPlanMode] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [queue, setQueue] = useState<string[]>([]);
   const [pendingPermission, setPendingPermission] = useState<{ calls: any[], resolve: (v: import('../../chat/chat-engine.js').PermissionResult) => void } | null>(null);
 
   const tokenLimit = 128_000;
@@ -62,12 +58,18 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     })));
   }, []);
 
+  const pushToast = useCallback((type: Toast['type'], message: string) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setToasts((prev) => [...prev, { id, type, message }].slice(-5));
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 2500);
+  }, []);
+
   const ensureEngine = useCallback(async () => {
     if (engineRef.current) return engineRef.current;
-
     const engine = new ChatEngine();
     engineRef.current = engine;
-
     await engine.initForInkUI({
       onState: (s: any) => {
         setTokens(s.tokens);
@@ -78,7 +80,6 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
         setPlanMode(s.planMode);
       },
       onMessage: (m: UIMessage) => setMessages((prev) => {
-        // If this message was being streamed, replace it with the final version
         const idx = prev.findIndex(item => item.id === m.id);
         if (idx >= 0) {
           const next = [...prev];
@@ -115,658 +116,130 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
       }),
     });
 
-    // apply persisted theme/provider (if any)
     try {
       const s = engine.conv.getCurrentSession();
-      if (!s) {
-        await refreshSessions();
-        return engine;
+      if (s) {
+        s.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
+        const t = s.settings.theme;
+        if (t === 'dark' || t === 'light' || t === 'high-contrast') setThemeName(t);
+        setSavedThreadRootId(s.settings.threadRootId ?? null);
+        setSavedThreadLeafId(s.settings.threadLeafId ?? null);
+        setRecentCommands(s.settings.recentCommands ?? []);
+        setUsage(s.settings.usage ?? {});
+        setProvider(s.settings.provider ?? 'unknown');
       }
-      // persist provider per session
-      let cfgProvider = 'unknown';
-      try {
-        const cfg = ConfigService.loadConfig();
-        cfgProvider = String(cfg.apiProvider ?? 'unknown');
-      } catch { }
-      s.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: cfgProvider };
-      if (!s.settings.provider || s.settings.provider === 'unknown') s.settings.provider = cfgProvider;
-      setProvider(s.settings.provider ?? 'unknown');
-      engine.conv.saveSession();
-      const t = s?.settings?.theme;
-      if (t === 'dark' || t === 'light' || t === 'high-contrast') setThemeName(t);
-      const tr = (s?.settings as any)?.threadRootId;
-      if (typeof tr === 'string' || tr === null) setSavedThreadRootId(tr ?? null);
-      const tl = (s?.settings as any)?.threadLeafId;
-      if (typeof tl === 'string' || tl === null) setSavedThreadLeafId(tl ?? null);
-
-      // validate: leaf must be reachable from root
-      if (tr && tl) {
-        const byId = new Map((s?.messages ?? []).map((m: any) => [m.id, m]));
-        let cur: any = byId.get(tl);
-        let ok = false;
-        while (cur) {
-          if (cur.id === tr) { ok = true; break; }
-          cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
-        }
-        if (!ok) {
-          setSavedThreadLeafId(null);
-          (s.settings as any).threadLeafId = null;
-          engine.conv.saveSession();
-        }
-      }
-      const rc = (s?.settings as any)?.recentCommands;
-      if (Array.isArray(rc)) setRecentCommands(rc.slice(0, 20));
-      const u = (s?.settings as any)?.usage;
-      if (u && typeof u === 'object') setUsage(u);
-      const pr = (s?.settings as any)?.provider;
-      if (typeof pr === 'string') setProvider(pr);
     } catch { }
 
     await refreshSessions();
-
     return engine;
-  }, []);
+  }, [refreshSessions]);
 
   useEffect(() => {
     ensureEngine().catch((err) => {
       pushToast('error', err?.message ?? 'Startup failed');
     });
-  }, [ensureEngine]);
-
-  const pushToast = useCallback((type: Toast['type'], message: string) => {
-    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    setToasts((prev) => [...prev, { id, type, message }].slice(-5));
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 2500);
-  }, []);
+  }, [ensureEngine, pushToast]);
 
   const incUsage = useCallback(async (key: string) => {
     const engine = await ensureEngine();
     const session = engine.getCurrentSession();
     if (!session) return;
     session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {} };
-    (session.settings as any).usage ??= {};
-    (session.settings as any).usage[key] = ((session.settings as any).usage[key] ?? 0) + 1;
-    setUsage({ ...(session.settings as any).usage });
+    session.settings.usage ??= {};
+    session.settings.usage[key] = (session.settings.usage[key] ?? 0) + 1;
+    setUsage({ ...session.settings.usage });
     engine.saveSession();
   }, [ensureEngine]);
 
   const archiveIfTooLarge = useCallback(async (cmd: any) => {
     const session = cmd?.conv.getCurrentSession();
     if (!session) return;
-
-    const WARN_AT = 2000;
-    const HARD_CAP = 5000;
-    if (session.messages.length < WARN_AT) return;
-
-    if (session.messages.length >= WARN_AT && session.messages.length < HARD_CAP) {
-      pushToast('warn', `Large session: ${session.messages.length} messages`);
-      return;
-    }
-
-    // Archive oldest messages to a JSON file, then trim
+    if (session.messages.length < 5000) return;
     try {
       const { writeFileSync } = await import('fs');
       const { join } = await import('path');
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const archiveCount = session.messages.length - (HARD_CAP - 500);
-      const archived = session.messages.slice(0, Math.max(0, archiveCount));
-      const remaining = session.messages.slice(archived.length);
-
+      const archived = session.messages.slice(0, 1000);
+      const remaining = session.messages.slice(1000);
       const sessionsDir = cmd.conv.constructor.SESSIONS_DIR;
       const outPath = join(sessionsDir, `${session.id}.archive.${stamp}.json`);
-      writeFileSync(outPath, JSON.stringify({
-        sessionId: session.id,
-        sessionName: session.name,
-        archivedAt: new Date().toISOString(),
-        messages: archived,
-      }, null, 2), 'utf-8');
-
+      writeFileSync(outPath, JSON.stringify({ sessionId: session.id, archivedAt: new Date().toISOString(), messages: archived }, null, 2), 'utf-8');
       session.messages = remaining;
       cmd.conv.saveSession();
-
-      // refresh UI messages as well
       setMessages((remaining ?? []).map((m: any) => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        timestamp: m.timestamp,
-        pinned: m.pinned,
-        reactions: m.reactions,
-        editedAt: m.editedAt,
-        parentMessageId: m.parentMessageId,
-        tags: m.tags,
-        provider: m.provider,
-        model: m.model,
-        tokensDelta: m.tokensDelta,
-        costDelta: m.costDelta,
+        id: m.id, role: m.role, content: m.content, timestamp: m.timestamp,
+        pinned: m.pinned, reactions: m.reactions, editedAt: m.editedAt,
+        parentMessageId: m.parentMessageId, tags: m.tags, provider: m.provider, model: m.model, tokensDelta: m.tokensDelta, costDelta: m.costDelta,
       })));
-
-      pushToast('success', `Archived ${archived.length} messages → ${outPath}`);
-    } catch (e: any) {
-      pushToast('error', e?.message ?? 'Archiving failed');
-    }
+      pushToast('success', `Archived 1000 messages → ${outPath}`);
+    } catch (e: any) { pushToast('error', e.message); }
   }, [pushToast]);
 
-  const onSubmit = useCallback(async (text: string) => {
+  const executePrompt = useCallback(async (text: string) => {
     const engine = await ensureEngine();
-    await archiveIfTooLarge(engine as any);
-
-    // UI-level commands handled here
-    if (text.startsWith('/load-session ')) {
-      const id = text.replace('/load-session', '').trim();
-      const loaded = engine.loadSession(id);
-      if (loaded) {
-        // Reset UI state to loaded session
-        setMessages((loaded.messages ?? []).map((m: any) => ({
-          id: m.id,
-          role: m.role,
-          content: m.content,
-          timestamp: m.timestamp,
-          pinned: m.pinned,
-          reactions: m.reactions,
-          editedAt: m.editedAt,
-          parentMessageId: m.parentMessageId,
-          tags: m.tags,
-          provider: m.provider,
-          model: m.model,
-          tokensDelta: m.tokensDelta,
-          costDelta: m.costDelta,
-        })));
-        setSessionName(loaded.name);
-        const t = loaded.settings?.theme;
-        if (t === 'dark' || t === 'light' || t === 'high-contrast') setThemeName(t);
-        const tr = (loaded.settings as any)?.threadRootId;
-        if (typeof tr === 'string' || tr === null) setSavedThreadRootId(tr ?? null);
-        const tl = (loaded.settings as any)?.threadLeafId;
-        if (typeof tl === 'string' || tl === null) setSavedThreadLeafId(tl ?? null);
-
-        // validate: leaf must be reachable from root
-        if (tr && tl) {
-          const byId = new Map((loaded.messages ?? []).map((m: any) => [m.id, m]));
-          let cur: any = byId.get(tl);
-          let ok = false;
-          while (cur) {
-            if (cur.id === tr) { ok = true; break; }
-            cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
-          }
-          if (!ok) {
-            setSavedThreadLeafId(null);
-            (loaded.settings as any).threadLeafId = null;
-            engine.saveSession();
-          }
-        }
-        const rc = (loaded.settings as any)?.recentCommands;
-        if (Array.isArray(rc)) setRecentCommands(rc.slice(0, 20));
-        const u = (loaded.settings as any)?.usage;
-        if (u && typeof u === 'object') setUsage(u);
-        const pr = (loaded.settings as any)?.provider;
-        if (typeof pr === 'string') setProvider(pr);
-        pushToast('success', `Loaded session: ${loaded.name}`);
-      } else {
-        pushToast('error', `Failed to load session: ${id}`);
-      }
-      await refreshSessions();
-      return;
-    }
-
-    if (text.startsWith('/delete-session ')) {
-      const id = text.replace('/delete-session', '').trim();
-      const ok = engine.deleteSession(id);
-      pushToast(ok ? 'success' : 'error', ok ? 'Session deleted' : 'Delete failed');
-      await refreshSessions();
-      return;
-    }
-
-    if (text.startsWith('/mode ')) {
-      await incUsage('mode-cmd');
-      const mode = text.replace('/mode', '').trim().toLowerCase();
-      if (!['interactive', 'trusted', 'on-failure'].includes(mode)) {
-        pushToast('error', `Invalid mode. Use: interactive, trusted, on-failure`);
-        return;
-      }
-      try {
-        ConfigService.updateConfig({ autonomyMode: mode as any });
-        if (engineRef.current) {
-          (engineRef.current as any).autonomyMode = mode;
-        }
-        pushToast('success', `Autonomy mode set to: ${mode}`);
-      } catch (err: any) {
-        pushToast('error', `Failed to set mode: ${err.message}`);
-      }
-      return;
-    }
-
-    if (text.startsWith('/tag-msg ')) {
-      await incUsage('tag-msg');
-      const rest = text.replace('/tag-msg', '').trim();
-      const firstSpace = rest.indexOf(' ');
-      const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
-      const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
-      let tag = raw;
-      try { tag = JSON.parse(raw); } catch { }
-
-      const session = engine.getCurrentSession();
-      const msg = session?.messages.find((m: any) => m.id === messageId);
-      if (!session || !msg) { pushToast('error', 'Message not found'); return; }
-      msg.tags ??= [];
-      if (!msg.tags.includes(tag)) msg.tags.push(tag);
-      engine.saveSession();
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, tags: msg.tags } : m)));
-      pushToast('success', `Tagged: ${tag}`);
-      return;
-    }
-
-    if (text.startsWith('/untag-msg ')) {
-      await incUsage('untag-msg');
-      const rest = text.replace('/untag-msg', '').trim();
-      const firstSpace = rest.indexOf(' ');
-      const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
-      const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
-      let tag = raw;
-      try { tag = JSON.parse(raw); } catch { }
-
-      const session = engine.getCurrentSession();
-      const msg = session?.messages.find((m: any) => m.id === messageId);
-      if (!session || !msg) { pushToast('error', 'Message not found'); return; }
-      msg.tags = (msg.tags ?? []).filter((t: string) => t !== tag);
-      engine.saveSession();
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, tags: msg.tags } : m)));
-      pushToast('success', `Removed tag: ${tag}`);
-      return;
-    }
-
-    if (text.startsWith('/prune-branch ')) {
-      await incUsage('prune-branch');
-      const leafId = text.replace('/prune-branch', '').trim();
-      const session = engine.getCurrentSession();
-      if (!session) return;
-
-      const byId = new Map<string, any>(session.messages.map((m: any) => [m.id, m]));
-      const toDelete = new Set<string>();
-      let cur: any = byId.get(leafId);
-      while (cur) {
-        toDelete.add(cur.id);
-        cur = cur.parentMessageId ? byId.get(cur.parentMessageId) : undefined;
-      }
-
-      const before = session.messages.length;
-      session.messages = session.messages.filter((m: any) => !toDelete.has(m.id));
-      // clear thread selection if it pointed into pruned set
-      if ((session.settings as any)?.threadLeafId && toDelete.has((session.settings as any).threadLeafId)) {
-        (session.settings as any).threadLeafId = null;
-        setSavedThreadLeafId(null);
-      }
-      if ((session.settings as any)?.threadRootId && toDelete.has((session.settings as any).threadRootId)) {
-        (session.settings as any).threadRootId = null;
-        (session.settings as any).threadLeafId = null;
-        setSavedThreadRootId(null);
-        setSavedThreadLeafId(null);
-      }
-      engine.saveSession();
-      setMessages((prev) => prev.filter((m) => !toDelete.has(m.id)));
-
-      pushToast('success', `Pruned ${before - session.messages.length} message(s)`);
-      return;
-    }
-
-    if (text.startsWith('/delete-msg ')) {
-      await incUsage('delete-msg');
-      const messageId = text.replace('/delete-msg', '').trim();
-      const session = engine.getCurrentSession();
-      if (!session) return;
-      const before = session.messages.length;
-      session.messages = session.messages.filter((m: any) => m.id !== messageId);
-      // clear thread selection if it pointed to deleted message
-      if ((session.settings as any)?.threadLeafId === messageId) (session.settings as any).threadLeafId = null;
-      if ((session.settings as any)?.threadRootId === messageId) {
-        (session.settings as any).threadRootId = null;
-        (session.settings as any).threadLeafId = null;
-      }
-      engine.saveSession();
-      setMessages((prev) => prev.filter((m) => m.id !== messageId));
-      if (savedThreadLeafId === messageId) setSavedThreadLeafId(null);
-      if (savedThreadRootId === messageId) {
-        setSavedThreadRootId(null);
-        setSavedThreadLeafId(null);
-      }
-      pushToast('success', before !== session.messages.length ? 'Message deleted' : 'Message not found');
-      return;
-    }
-
-    if (text.startsWith('/edit-asst ')) {
-      await incUsage('edit-asst');
-      const rest = text.replace('/edit-asst', '').trim();
-      const firstSpace = rest.indexOf(' ');
-      const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
-      const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
-      let newContent = raw;
-      try { newContent = JSON.parse(raw); } catch { }
-
-      const session = engine.getCurrentSession();
-      const msg = session?.messages.find((m: any) => m.id === messageId);
-      if (!session || !msg) { pushToast('error', 'Message not found'); return; }
-      if (msg.role !== 'assistant') { pushToast('warn', 'Not an assistant message'); return; }
-      msg.content = newContent;
-      msg.editedAt = new Date().toISOString();
-      engine.saveSession();
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: typeof newContent === 'string' ? [{ type: 'text', text: newContent }] : newContent, editedAt: msg.editedAt } : m)));
-      pushToast('success', 'Assistant message edited');
-      return;
-    }
-
-    if (text.startsWith('/edit-branch ')) {
-      await incUsage('edit-branch');
-      // Format: /edit-branch <messageId> <jsonContent>
-      const rest = text.replace('/edit-branch', '').trim();
-      const firstSpace = rest.indexOf(' ');
-      const messageId = firstSpace === -1 ? rest : rest.slice(0, firstSpace);
-      const raw = firstSpace === -1 ? '' : rest.slice(firstSpace + 1).trim();
-      let newContent = raw;
-      try { newContent = JSON.parse(raw); } catch { }
-
-      const session = engine.getCurrentSession();
-      if (!session) return;
-
-      const msg = session.messages.find((m: any) => m.id === messageId);
-      if (!msg) {
-        pushToast('error', 'Message not found');
-        return;
-      }
-
-      msg.content = newContent;
-      msg.editedAt = new Date().toISOString();
-      engine.saveSession();
-
-      // Update UI message content
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, content: typeof newContent === 'string' ? [{ type: 'text', text: newContent }] : newContent, editedAt: msg.editedAt } : m)));
-
-      // Start branch from this message
-      setBranchParentId(messageId);
-
-      // Re-run using edited message content as next prompt if it's a user message
-      if (msg.role === 'user' && typeof newContent === 'string') {
-        pushToast('info', 'Re-running edited message as new branch…');
-        await engine.handleInkLine(newContent);
-        await refreshSessions();
-        pushToast('success', 'Branched re-run complete');
-      } else {
-        pushToast('warn', 'Edited message is not a user prompt; branch will apply to your next message');
-      }
-      return;
-    }
-
-    if (text.startsWith('/edit-last ')) {
-      await incUsage('edit-last');
-      // edit last user message content in session and rerun
-      const raw = text.replace('/edit-last', '').trim();
-      let newPrompt = raw;
-      try { newPrompt = JSON.parse(raw); } catch { }
-
-      const session = engine.getCurrentSession();
-      if (session) {
-        const idx = [...session.messages].reverse().findIndex((m: any) => m.role === 'user');
-        if (idx >= 0) {
-          const realIdx = session.messages.length - 1 - idx;
-          session.messages[realIdx].content = newPrompt;
-          session.messages[realIdx].editedAt = new Date().toISOString();
-          engine.saveSession();
-
-          // Also update engine msgs list (best-effort): replace last user in cmd.msgs
-          // rerun
-          await engine.handleInkLine(newPrompt);
-          pushToast('success', 'Re-ran edited prompt');
-        }
-      }
-
-      await refreshSessions();
-      return;
-    }
-
-    if (text.startsWith('/accept-run ')) {
-      await incUsage('accept-run');
-      const runId = text.replace('/accept-run', '').trim();
-      setDiffGroups((prev) => {
-        const copy = { ...prev };
-        delete copy[runId];
-        return copy;
-      });
-      setDiffs((prev) => prev.filter((d: any) => (d.toolRunId ?? 'unknown') !== runId));
-      pushToast('success', `Accepted run ${runId}`);
-      return;
-    }
-
-    if (text.startsWith('/revert-run ')) {
-      await incUsage('revert-run');
-      const runId = text.replace('/revert-run', '').trim();
-      const snaps = snapshotGroups[runId];
-      if (!snaps || snaps.length === 0) {
-        pushToast('warn', 'No snapshots for that run');
-        return;
-      }
-      try {
-        const { writeFileSync, existsSync, unlinkSync } = await import('fs');
-        for (const snap of snaps as any[]) {
-          if (snap.existed && snap.content !== null) {
-            writeFileSync(snap.absPath, snap.content, 'utf-8');
-          } else if (!snap.existed && existsSync(snap.absPath)) {
-            unlinkSync(snap.absPath);
-          }
-        }
-        // remove diffs for this run
-        setDiffGroups((prev) => {
-          const copy = { ...prev };
-          delete copy[runId];
-          return copy;
-        });
-        setDiffs((prev) => prev.filter((d: any) => (d.toolRunId ?? 'unknown') !== runId));
-        pushToast('success', `Reverted run ${runId}`);
-      } catch (e: any) {
-        pushToast('error', e?.message ?? 'Revert run failed');
-      }
-      return;
-    }
-
-    if (text.startsWith('/accept-diffs')) {
-      await incUsage('accept-diffs');
-      setDiffs([]);
-      pushToast('success', 'Diffs accepted');
-      return;
-    }
-
-    if (text.startsWith('/export-ui ')) {
-      await incUsage('export');
-      const rest = text.replace('/export-ui', '').trim().split(' ');
-      const format = rest[0] as 'md' | 'json' | undefined;
-      const outPath = rest.slice(1).join(' ').trim();
-      const session = engine.getCurrentSession();
-      if (!format || !outPath || !session) {
-        pushToast('error', 'Export usage: /export-ui <md|json> <path>');
-        return;
-      }
-
-      try {
-        const { writeFileSync } = await import('fs');
-        if (format === 'json') {
-          writeFileSync(outPath, JSON.stringify(session, null, 2), 'utf-8');
-        } else {
-          const lines: string[] = [];
-          lines.push(`# ${session.name}`);
-          lines.push('');
-          for (const m of session.messages) {
-            const who = m.role === 'user' ? 'You' : m.role === 'assistant' ? 'Optimus' : 'System';
-            lines.push(`## ${who}`);
-            lines.push('');
-            const txt = getTextFromContent(m.content as any);
-            lines.push(txt);
-            lines.push('');
-          }
-          writeFileSync(outPath, lines.join('\n'), 'utf-8');
-        }
-        pushToast('success', `Exported: ${outPath}`);
-      } catch (e: any) {
-        pushToast('error', e?.message ?? 'Export failed');
-      }
-      return;
-    }
-
-    if (text.startsWith('/import ')) {
-      await incUsage('import');
-      const filePath = text.replace('/import', '').trim();
-      try {
-        const { readFileSync, writeFileSync } = await import('fs');
-        const { join } = await import('path');
-        const raw = readFileSync(filePath, 'utf-8');
-        const session = JSON.parse(raw);
-        if (!session || !session.id || !Array.isArray(session.messages)) {
-          pushToast('error', 'Invalid session JSON');
-          return;
-        }
-
-        // Save into sessions directory (same path as ConversationService uses)
-        const sessionsDir = (engine.conv.constructor as any).SESSIONS_DIR;
-        const outPath = join(sessionsDir, `${session.id}.json`);
-        writeFileSync(outPath, JSON.stringify(session, null, 2), 'utf-8');
-
-        // Load it
-        const loaded = engine.loadSession(session.id);
-        if (loaded) {
-          setMessages((loaded.messages ?? []).map((m: any) => ({
-            id: m.id,
-            role: m.role,
-            content: m.content,
-            timestamp: m.timestamp,
-            pinned: m.pinned,
-            reactions: m.reactions,
-            editedAt: m.editedAt,
-            parentMessageId: m.parentMessageId,
-            tags: m.tags,
-            provider: m.provider,
-            model: m.model,
-            tokensDelta: m.tokensDelta,
-            costDelta: m.costDelta,
-          })));
-          setSessionName(loaded.name);
-          pushToast('success', 'Session imported');
-        }
-        await refreshSessions();
-      } catch (e: any) {
-        pushToast('error', e?.message ?? 'Import failed');
-      }
-      return;
-    }
-
-    if (text.startsWith('/revert-all')) {
-      await incUsage('revert-all');
-      const restored = engine.revertAll();
-      if (restored.length > 0) {
-        pushToast('success', `Reverted ${restored.length} file(s)`);
-      } else {
-        pushToast('warn', 'Nothing to revert');
-      }
-      await refreshSessions();
-      return;
-    }
-
-    if (text.startsWith('/revert-file ')) {
-      await incUsage('revert-file');
-      const rel = text.replace('/revert-file', '').trim();
-      const ok = await engine.revertFile(rel);
-      pushToast(ok ? 'success' : 'warn', ok ? `Reverted ${rel}` : `No snapshot for ${rel}`);
-      return;
-    }
-
-    if (text.startsWith('/recent-cmd')) {
-      await incUsage('palette-select');
-      const raw = text.replace('/recent-cmd', '').trim();
-      const cmdText = raw;
-      const session = engine.getCurrentSession();
-      if (session) {
-        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null };
-        session.settings.recentCommands ??= [];
-        if (cmdText) {
-          session.settings.recentCommands = [cmdText, ...session.settings.recentCommands.filter((x: string) => x !== cmdText)].slice(0, 20);
-          setRecentCommands(session.settings.recentCommands);
-          engine.saveSession();
-        }
-      }
-      return;
-    }
-
-    if (text.startsWith('/thread-leaf')) {
-      const raw = text.replace('/thread-leaf', '').trim();
-      const session = engine.getCurrentSession();
-      if (session) {
-        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
-        (session.settings as any).threadLeafId = raw || null;
-        engine.saveSession();
-        setSavedThreadLeafId(raw || null);
-        pushToast('success', raw ? 'Branch leaf selected' : 'Leaf cleared');
-      }
-      return;
-    }
-
-    if (text.startsWith('/thread-root')) {
-      const raw = text.replace('/thread-root', '').trim();
-      const session = engine.getCurrentSession();
-      if (session) {
-        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
-        (session.settings as any).threadRootId = raw || null;
-        (session.settings as any).threadLeafId = null;
-        setSavedThreadRootId(raw || null);
-        setSavedThreadLeafId(null);
-        engine.saveSession();
-        pushToast('success', raw ? 'Thread selected' : 'Thread cleared');
-      }
-      return;
-    }
-
-    if (text.startsWith('/branch ')) {
-      await incUsage('branch');
-      const parentId = text.replace('/branch', '').trim();
-      setBranchParentId(parentId || null);
-      pushToast('info', 'Branch started. Your next message will be attached to the selected parent.');
-      return;
-    }
-
-    if (text.startsWith('/search-all ')) {
-      await incUsage('search-all');
-      const raw = text.replace('/search-all', '').trim();
-      let q = raw;
-      try { q = JSON.parse(raw); } catch { }
-
-      const query = String(q).trim().toLowerCase();
-      const list = engine.conv.listSessions();
-      const hits: GlobalSearchHit[] = [];
-      for (const s of list) {
-        for (const m of s.messages ?? []) {
-          const content = getTextFromContent(m.content as any);
-          if (content.toLowerCase().includes(query)) {
-            hits.push({
-              sessionId: s.id,
-              sessionName: s.name,
-              messageId: m.id,
-              preview: content.replace(/\n/g, ' ').slice(0, 90),
-            });
-            if (hits.length >= 50) break;
-          }
-        }
-        if (hits.length >= 50) break;
-      }
-      setGlobalHits(hits);
-      pushToast('info', `Found ${hits.length} hit(s)`);
-      return;
-    }
-
     try {
       setIsGenerating(true);
-      // If we're in a branch, attach parentMessageId to the next user message at persistence level.
+      if (text.startsWith('!')) {
+        await incUsage('quick-exec');
+        const cmd = text.slice(1).trim();
+        if (!cmd) return;
+        pushToast('info', `Running: ${cmd}`);
+        try {
+          const { execSync } = await import('child_process');
+          const output = execSync(cmd, { encoding: 'utf-8', stdio: 'pipe' });
+          engine.conv.addMessage('user', text);
+          engine.conv.addMessage('assistant', `\`\`\`bash\n${output}\n\`\`\``);
+        } catch (e: any) {
+          engine.conv.addMessage('user', text);
+          engine.conv.addMessage('assistant', `\`\`\`bash\nCommand failed: ${e.message}\n${e.stdout || ''}\n${e.stderr || ''}\n\`\`\``);
+        }
+        engine.saveSession();
+        const s = engine.getCurrentSession();
+        if (s) {
+          setMessages((s.messages ?? []).map((m: any) => ({
+            id: m.id, role: m.role,
+            content: typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content,
+            timestamp: m.timestamp, pinned: m.pinned, reactions: m.reactions,
+            editedAt: m.editedAt, parentMessageId: m.parentMessageId, tags: m.tags,
+            provider: m.provider, model: m.model, tokensDelta: m.tokensDelta, costDelta: m.costDelta
+          })));
+        }
+        await refreshSessions();
+        return;
+      }
+
+      if (text.startsWith('/compact')) {
+        await incUsage('compact');
+        pushToast('info', 'Compacting session...');
+        try {
+          await engine.handleInkLine('Please summarize our entire conversation so far into a concise technical document.');
+          const s = engine.getCurrentSession();
+          if (s) {
+            const lastM = s.messages.pop();
+            s.messages = lastM ? [lastM] : [];
+            engine.saveSession();
+            setMessages((s.messages ?? []).map((m: any) => ({
+              id: m.id, role: m.role, content: m.content as any, timestamp: m.timestamp,
+              pinned: m.pinned, reactions: m.reactions, editedAt: m.editedAt,
+              parentMessageId: m.parentMessageId, tags: m.tags, provider: m.provider, model: m.model, tokensDelta: m.tokensDelta, costDelta: m.costDelta
+            })));
+          }
+          pushToast('success', 'Compacted');
+        } catch (e: any) { pushToast('error', e.message); }
+        return;
+      }
+
+      if (text.startsWith('/review')) {
+        await incUsage('review');
+        pushToast('info', 'Reviewing diffs...');
+        try {
+          await engine.handleInkLine('Review the current git diff using git_diff.');
+        } catch (e: any) { pushToast('error', e.message); }
+        return;
+      }
+
       if (branchParentId && !text.startsWith('/')) {
-        // Add user message with parentMessageId to session + engine
-        // Persist branch relationship; engine will read from persisted session
         engine.conv.addMessage('user', text, { parentMessageId: branchParentId });
-        // Clear branch parent once used
         setBranchParentId(null);
         await engine.handleInkLine(text);
       } else {
@@ -778,7 +251,84 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
       setIsGenerating(false);
     }
     await refreshSessions();
-  }, [ensureEngine, refreshSessions]);
+  }, [ensureEngine, refreshSessions, branchParentId, pushToast, incUsage]);
+
+  const onSubmit = useCallback(async (text: string) => {
+    if (isGenerating) {
+      setQueue((prev) => [...prev, text]);
+      pushToast('info', 'Message queued...');
+      return;
+    }
+    const engine = await ensureEngine();
+    await archiveIfTooLarge(engine as any);
+
+    if (text.startsWith('/load-session ')) {
+      const id = text.replace('/load-session', '').trim();
+      const loaded = engine.loadSession(id);
+      if (loaded) {
+        setMessages((loaded.messages ?? []).map((m: any) => ({
+          id: m.id, role: m.role, content: m.content as any, timestamp: m.timestamp,
+          pinned: m.pinned, reactions: m.reactions, editedAt: m.editedAt,
+          parentMessageId: m.parentMessageId, tags: m.tags, provider: m.provider, model: m.model, tokensDelta: m.tokensDelta, costDelta: m.costDelta
+        })));
+        setSessionName(loaded.name);
+        await refreshSessions();
+        pushToast('success', `Loaded: ${loaded.name}`);
+      } else pushToast('error', 'Failed to load');
+      return;
+    }
+
+    if (text.startsWith('/mode ')) {
+      const mode = text.replace('/mode', '').trim().toLowerCase();
+      try {
+        ConfigService.updateConfig({ autonomyMode: mode as any });
+        pushToast('success', `Mode: ${mode}`);
+      } catch (e: any) { pushToast('error', e.message); }
+      return;
+    }
+
+    if (text.startsWith('/search-all ')) {
+      const q = text.replace('/search-all', '').trim().toLowerCase();
+      const list = engine.conv.listSessions();
+      const hits: GlobalSearchHit[] = [];
+      for (const s of list) {
+        for (const m of s.messages ?? []) {
+          const content = getTextFromContent(m.content as any);
+          if (content.toLowerCase().includes(q)) {
+            hits.push({ sessionId: s.id, sessionName: s.name, messageId: m.id, preview: content.slice(0, 90) });
+            if (hits.length >= 50) break;
+          }
+        }
+        if (hits.length >= 50) break;
+      }
+      setGlobalHits(hits);
+      pushToast('info', `Found ${hits.length} hits`);
+      return;
+    }
+
+    if (text.startsWith('/recent-cmd')) {
+      const cmdText = text.replace('/recent-cmd', '').trim();
+      const session = engine.getCurrentSession();
+      if (session) {
+        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
+        const rc = session.settings.recentCommands || [];
+        session.settings.recentCommands = [cmdText, ...rc.filter(x => x !== cmdText)].slice(0, 20);
+        setRecentCommands(session.settings.recentCommands);
+        engine.saveSession();
+      }
+      return;
+    }
+
+    await executePrompt(text);
+  }, [ensureEngine, refreshSessions, pushToast, incUsage, isGenerating, executePrompt]);
+
+  useEffect(() => {
+    if (!isGenerating && queue.length > 0) {
+      const next = queue[0];
+      setQueue((prev) => prev.slice(1));
+      executePrompt(next);
+    }
+  }, [isGenerating, queue, executePrompt]);
 
   useEffect(() => {
     if (initialPrompt && !initialPromptHandled && !isGenerating) {
@@ -791,41 +341,17 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     const engine = await ensureEngine();
     const session = engine.getCurrentSession();
     if (!session) return;
-
-    // Find last assistant message and last user message
-    const lastAssistantIdx = [...session.messages].reverse().findIndex((m: any) => m.role === 'assistant');
-    const lastUser = [...session.messages].reverse().find((m: any) => m.role === 'user');
-    if (lastAssistantIdx < 0 || !lastUser) return;
-
-    // Remove the last assistant message from persisted session
-    const realAIdx = session.messages.length - 1 - lastAssistantIdx;
-    session.messages.splice(realAIdx, 1);
-    engine.saveSession();
-
-    // Also remove last assistant from UI messages
-    setMessages((prev) => {
-      const idx = [...prev].reverse().findIndex((m) => m.role === 'assistant');
-      if (idx < 0) return prev;
-      const ridx = prev.length - 1 - idx;
-      const copy = [...prev];
-      copy.splice(ridx, 1);
-      return copy;
-    });
-
-    pushToast('info', 'Regenerating last response…');
-
-    // Re-run: ask engine with last user content
-    if (typeof lastUser.content === 'string') {
-      try {
-        setIsGenerating(true);
-        await engine.handleInkLine(lastUser.content);
-        await refreshSessions();
-        pushToast('success', 'Regenerated');
-      } finally {
-        setIsGenerating(false);
-      }
-    }
-  }, [ensureEngine, pushToast, refreshSessions]);
+    const lastAIdx = [...session.messages].reverse().findIndex(m => m.role === 'assistant');
+    if (lastAIdx < 0) return;
+    session.messages.splice(session.messages.length - 1 - lastAIdx, 1);
+    const lastUser = [...session.messages].reverse().find(m => m.role === 'user');
+    if (!lastUser) return;
+    pushToast('info', 'Regenerating…');
+    try {
+      setIsGenerating(true);
+      await engine.handleInkLine(getTextFromContent(lastUser.content as any));
+    } finally { setIsGenerating(false); }
+  }, [ensureEngine, pushToast]);
 
   const onTogglePinLast = useCallback(async () => {
     const engine = await ensureEngine();
@@ -837,55 +363,13 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     await engine.reactLast(reaction);
   }, [ensureEngine]);
 
-  const onApproveTools = useCallback(() => {
-    if (pendingPermission) {
-      pendingPermission.resolve('yes');
-      setPendingPermission(null);
-    }
-  }, [pendingPermission]);
-
-  const onDenyTools = useCallback(() => {
-    if (pendingPermission) {
-      pendingPermission.resolve('no');
-      setPendingPermission(null);
-    }
-  }, [pendingPermission]);
-
-  const onAlwaysApprove = useCallback(() => {
-    if (pendingPermission) {
-      pendingPermission.resolve('always');
-      setPendingPermission(null);
-    }
-  }, [pendingPermission]);
-
-  const onFeedbackTools = useCallback((text: string) => {
-    if (pendingPermission) {
-      pendingPermission.resolve({ type: 'feedback', text });
-      setPendingPermission(null);
-    }
-  }, [pendingPermission]);
+  const onApproveTools = useCallback(() => { if (pendingPermission) { pendingPermission.resolve('yes'); setPendingPermission(null); } }, [pendingPermission]);
+  const onDenyTools = useCallback(() => { if (pendingPermission) { pendingPermission.resolve('no'); setPendingPermission(null); } }, [pendingPermission]);
+  const onAlwaysApprove = useCallback(() => { if (pendingPermission) { pendingPermission.resolve('always'); setPendingPermission(null); } }, [pendingPermission]);
+  const onFeedbackTools = useCallback((text: string) => { if (pendingPermission) { pendingPermission.resolve({ type: 'feedback', text }); setPendingPermission(null); } }, [pendingPermission]);
 
   const getRuntimeState = useCallback(() => ({
-    tokens,
-    cost,
-    toolsEnabled,
-    planMode,
-    tools,
-    diffs,
-    diffGroups,
-    snapshotGroups,
-    messages,
-    sessions,
-    globalHits,
-    toasts,
-    themeName,
-    savedThreadRootId,
-    savedThreadLeafId,
-    recentCommands,
-    usage,
-    provider,
-    isGenerating,
-    pendingPermission,
+    tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission,
   }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission]);
 
   const ready = useMemo(() => Boolean(model), [model]);
