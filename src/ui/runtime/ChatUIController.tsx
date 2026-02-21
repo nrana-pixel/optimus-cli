@@ -38,6 +38,8 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const [recentCommands, setRecentCommands] = useState<string[]>([]);
   const [usage, setUsage] = useState<Record<string, number>>({});
   const [provider, setProvider] = useState<string>('unknown');
+  const [branch, setBranch] = useState<string>('');
+  const [cwd, setCwd] = useState<string>(process.cwd());
   const [toolsEnabled, setToolsEnabled] = useState(true);
   const [planMode, setPlanMode] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -78,6 +80,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
         setSessionName(s.sessionName);
         setToolsEnabled(s.toolsEnabled);
         setPlanMode(s.planMode);
+        if (s.provider) setProvider(s.provider);
       },
       onMessage: (m: UIMessage) => setMessages((prev) => {
         const idx = prev.findIndex(item => item.id === m.id);
@@ -131,6 +134,16 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     } catch { }
 
     await refreshSessions();
+
+    try {
+      const { GitService } = await import('../../services/git.service.js');
+      const git = new GitService(process.cwd());
+      if (await git.isGitRepo()) {
+        const b = await git.getCurrentBranch();
+        setBranch(b);
+      }
+    } catch { }
+
     return engine;
   }, [refreshSessions]);
 
@@ -369,8 +382,8 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const onFeedbackTools = useCallback((text: string) => { if (pendingPermission) { pendingPermission.resolve({ type: 'feedback', text }); setPendingPermission(null); } }, [pendingPermission]);
 
   const getRuntimeState = useCallback(() => ({
-    tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission,
-  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission]);
+    tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission, branch, cwd,
+  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission, branch, cwd]);
 
   const ready = useMemo(() => Boolean(model), [model]);
 

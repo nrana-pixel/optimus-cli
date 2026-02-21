@@ -168,7 +168,7 @@ export class ConversationService {
   /**
    * Add a message to the current session
    */
-  addMessage(role: 'user' | 'assistant' | 'system', content: string | any[], opts?: Partial<Omit<Message, 'id' | 'role' | 'content' | 'timestamp'>>): Message {
+  addMessage(role: 'user' | 'assistant' | 'system', content: string | any[], opts?: Partial<Omit<Message, 'role' | 'content' | 'timestamp'>>): Message {
     if (!this.currentSession) {
       throw new Error('No active session');
     }
@@ -187,6 +187,18 @@ export class ConversationService {
     this.currentSession.updatedAt = new Date().toISOString();
 
     return message;
+  }
+
+  /**
+   * Update an existing message
+   */
+  updateMessage(id: string, updates: Partial<Omit<Message, 'id'>>): boolean {
+    if (!this.currentSession) return false;
+    const idx = this.currentSession.messages.findIndex(m => m.id === id);
+    if (idx === -1) return false;
+    this.currentSession.messages[idx] = { ...this.currentSession.messages[idx], ...updates };
+    this.currentSession.updatedAt = new Date().toISOString();
+    return true;
   }
 
   /**

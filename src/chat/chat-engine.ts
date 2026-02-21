@@ -124,6 +124,7 @@ export class ChatEngine {
       sessionName: this.sessName,
       toolsEnabled: this.toolsEnabled,
       planMode: this.planMode,
+      provider: cfg.apiProvider,
     });
   }
 
@@ -241,21 +242,20 @@ export class ChatEngine {
       this.llm = new LLMServiceLiteLLM();
     }
 
-    // Persist + emit user message
+    // 1. Emit + Persist User Message
+    const userMsgId = `msg-${Date.now()}-user`;
     this.msgs.push({ role: 'user', content: line });
     this.conv.addMessage('user', line);
     this.inkHooks?.onMessage({
-      id: `msg-${Date.now()}-user`,
+      id: userMsgId,
       role: 'user',
       content: [{ type: 'text', text: line }],
       timestamp: new Date().toISOString(),
     } as any);
 
-    // Build system context
+    // 2. Prepare Context
     const mcpSection = this.mcpService.getTools().length > 0 ? this.mcpService.mcpToolsSection() : '';
     const repoMapSection = this.repoMap ? `\n\n${this.repoMap}` : '';
-    
-    // Read hierarchical local instructions (AGENTS.md)
     const localInstructions = ToolsService.readLocalInstructions(resolve('.'), resolve('.'));
 
     const systemMsg = this.toolsEnabled
@@ -264,10 +264,9 @@ export class ChatEngine {
 
     let msgs = [...systemMsg, ...this.msgs];
 
-    // Tool loop
-    const MAX_LOOPS = 8;
+    // 3. Tool loop
+    const MAX_LOOPS = 10;
     let loops = 0;
-
     const tools = new ToolsService(resolve('.'));
     tools.planMode = this.planMode;
     if (this.indexService) {
@@ -277,35 +276,30 @@ export class ChatEngine {
     this.lastTools = tools;
 
     const nativeTools = [...ToolsService.getNativeTools(this.planMode), ...this.mcpService.getNativeTools()];
-
-    let fullFinal = '';
-    let turnDeltaTokens = 0;
-    let turnDeltaCost = 0;
-
-    let currentAssistantContent = '';
-    const assistantMsgId = `msg-${Date.now()}-assistant`;
-
-    // Adaptive Stream Controller
-    const stream = new StreamController({
-      onEmit: (uiText) => {
-        // Strip internal tags before sending to UI
-        const cleanedText = uiText
-          .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
-          .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
-          .trim();
-
-        this.inkHooks?.onPartialMessage({
-          id: assistantMsgId,
-          role: 'assistant',
-          content: [{ type: 'text', text: cleanedText }],
-          timestamp: new Date().toISOString(),
-        } as any);
-      }
-    });
+    let turnWrittenCount = 0;
 
     while (loops < MAX_LOOPS) {
       loops++;
-      
+      const assistantMsgId = `msg-${Date.now()}-assistant-${loops}`;
+      let currentAssistantContent = '';
+
+      // Create a fresh stream for this turn
+      const stream = new StreamController({
+        onEmit: (uiText) => {
+          const cleanedText = uiText
+            .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
+            .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
+            .trim();
+
+          this.inkHooks?.onPartialMessage({
+            id: assistantMsgId,
+            role: 'assistant',
+            content: [{ type: 'text', text: cleanedText }],
+            timestamp: new Date().toISOString(),
+          } as any);
+        }
+      });
+
       const res = await this.llm.completeWithHistory(msgs, {
         onChunk: (chunk) => {
           currentAssistantContent += chunk;
@@ -316,43 +310,99 @@ export class ChatEngine {
       stream.finalize();
       this.tokens += res.tokensUsed.total;
       this.cost += res.cost.total;
-      turnDeltaTokens += res.tokensUsed.total;
-      turnDeltaCost += res.cost.total;
 
       const full = res.content;
       msgs.push({ role: 'assistant', content: full });
-      fullFinal += (fullFinal ? '\n' : '') + full;
+      this.msgs.push({ role: 'assistant', content: full });
+      
+      this.conv.addMessage('assistant', full, { tokensDelta: res.tokensUsed.total, costDelta: res.cost.total });
+      this.conv.updateMetadata(this.tokens, this.cost);
+      this.conv.saveSession();
+
+      // Helper to generate diffs for messages
+      const getDiffBlocks = async (newWritten: any[]) => {
+        const blocks: any[] = [];
+        for (const writtenFile of newWritten) {
+          try {
+            const snapshot = tools.snapshots.find(s => s.absPath === writtenFile.absPath);
+            const oldContent = snapshot?.existed ? snapshot.content || '' : '';
+            const { readFileSync } = await import('fs');
+            const newContent = readFileSync(writtenFile.absPath, 'utf-8');
+            const diffText = createTwoFilesPatch(writtenFile.path, writtenFile.path, oldContent, newContent, '', '', { context: 3 });
+            blocks.push({ type: 'diff', path: writtenFile.path, diffText, language: writtenFile.path.split('.').pop() || 'text' });
+          } catch { }
+        }
+        return blocks;
+      };
+
+      const cleanedFinal = full
+        .replace(/<use_tool>[\s\S]*?<\/use_tool>\s*/g, '')
+        .replace(/\[PLANNER NOTE[\s\S]*?\]\n?/g, '')
+        .trim();
+
+      const newWritten = tools.written.slice(turnWrittenCount);
+      turnWrittenCount = tools.written.length;
+      const diffBlocks = await getDiffBlocks(newWritten);
+
+      this.inkHooks?.onMessage({
+        id: assistantMsgId,
+        role: 'assistant',
+        content: [{ type: 'text', text: cleanedFinal }, ...diffBlocks],
+        timestamp: new Date().toISOString(),
+      } as any);
 
       if (!this.toolsEnabled) break;
       const toolCalls = res.toolCalls || [];
       if (!toolCalls.length) break;
 
-      // --- PERMISSION CHECK ---
+      // --- PERMISSION ---
       let approved = true;
       let needsPermission = false;
-
       if (this.inkHooks && !this.planMode && !this.sessionPermissionGranted) {
-        if (this.autonomyMode === 'interactive') {
-          needsPermission = true;
-        } else if (this.autonomyMode === 'on-failure' && this.lastTurnHadError) {
+        if (this.autonomyMode === 'interactive' || (this.autonomyMode === 'on-failure' && this.lastTurnHadError)) {
           needsPermission = true;
         }
       }
 
       if (needsPermission) {
+        const permMsgId = `msg-${Date.now()}-perm-${loops}`;
+        const permContent = [{ type: 'permission-request', calls: toolCalls, status: 'pending' as const }];
+        
+        this.inkHooks?.onMessage({
+          id: permMsgId,
+          role: 'system',
+          content: permContent,
+          timestamp: new Date().toISOString(),
+        } as any);
+        
+        this.conv.addMessage('system', permContent, { id: permMsgId });
+        this.conv.saveSession();
+
         const result = await this.inkHooks!.onPermissionRequest(toolCalls);
+        let decisionStatus: 'approved' | 'denied' = 'approved';
+
         if (result === 'no') {
           approved = false;
-          msgs.push({ role: 'user', content: 'Tool execution was denied by the user. Do not try again unless asked.' });
+          decisionStatus = 'denied';
+          msgs.push({ role: 'user', content: 'Tool execution was denied by the user.' });
         } else if (result === 'always') {
           this.sessionPermissionGranted = true;
-          approved = true;
         } else if (typeof result === 'object' && result.type === 'feedback') {
           approved = false;
+          decisionStatus = 'denied';
           msgs.push({ role: 'user', content: `Tool execution denied. User feedback: ${result.text}` });
-        } else {
-          approved = true;
         }
+
+        const updatedContent = [{ type: 'permission-request', calls: toolCalls, status: decisionStatus }];
+        this.inkHooks?.onMessage({
+          id: permMsgId,
+          role: 'system',
+          content: updatedContent,
+          timestamp: new Date().toISOString(),
+        } as any);
+
+        this.conv.updateMessage(permMsgId, { content: updatedContent });
+        this.conv.saveSession();
       }
 
       if (!approved) {
@@ -360,22 +410,16 @@ export class ChatEngine {
         break;
       }
 
-      // Execute each tool call IN PARALLEL
+      // Execute Tools
       let hasError = false;
       const resultPromises = toolCalls.map(async (call) => {
-        // MCP tool routing
         if (this.mcpService.isMCPTool(call.name)) {
           const mcpResult = await this.mcpService.callTool(call.name, call.args as Record<string, unknown>);
           if (mcpResult.isError) hasError = true;
-          const body = mcpResult.isError ? `ERROR: ${mcpResult.content}` : mcpResult.content;
-          return `<tool_result>\n<name>${call.name}</name>\n<output>\n${body}\n</output>\n</tool_result>`;
+          return `<tool_result>\n<name>${call.name}</name>\n<output>\n${mcpResult.isError ? `ERROR: ${mcpResult.content}` : mcpResult.content}\n</output>\n</tool_result>`;
         }
-
-        // Native ToolsService routing
         const result = await tools.execute({ name: call.name as any, args: call.args });
-        if (result.error || (call.name === 'run_command' && result.output.includes('Command failed:'))) {
-          hasError = true;
-        }
+        if (result.error || (call.name === 'run_command' && result.output.includes('Command failed:'))) hasError = true;
         return ToolsService.formatToolResult(result);
       });
 
@@ -383,50 +427,7 @@ export class ChatEngine {
       this.lastTurnHadError = hasError;
       msgs.push({ role: 'user', content: resultParts.join('\n\n') + '\n\nContinue with your response.' });
     }
-    const finalContentBlocks: import('../ui/types.js').ContentBlock[] = [];
-    if (fullFinal) {
-      finalContentBlocks.push({ type: 'text', text: fullFinal });
-    }
-
-    // Generate diffs for any written files
-    if (tools.written.length > 0) {
-      for (const writtenFile of tools.written) {
-        const snapshot = tools.snapshots.find(s => s.absPath === writtenFile.absPath);
-        const oldContent = snapshot?.existed ? snapshot.content || '' : '';
-        const newContent = (await import('fs')).readFileSync(writtenFile.absPath, 'utf-8');
-        
-        const diffText = createTwoFilesPatch(
-          writtenFile.path,
-          writtenFile.path,
-          oldContent,
-          newContent,
-          '',
-          '',
-          { context: 3 }
-        );
-
-        finalContentBlocks.push({
-          type: 'diff',
-          path: writtenFile.path,
-          diffText,
-          language: writtenFile.path.split('.').pop() || 'text'
-        });
-      }
-    }
-
-    this.msgs.push({ role: 'assistant', content: fullFinal });
-    this.conv.addMessage('assistant', fullFinal, { tokensDelta: turnDeltaTokens, costDelta: turnDeltaCost });
-    this.conv.updateMetadata(this.tokens, this.cost);
-    this.conv.saveSession();
-
-    this.inkHooks?.onMessage({
-      id: assistantMsgId,
-      role: 'assistant',
-      content: finalContentBlocks,
-      timestamp: new Date().toISOString(),
-    } as any);
-
-    // Emit updated state
+    
     this.inkHooks?.onState({
       tokens: this.tokens,
       cost: this.cost,

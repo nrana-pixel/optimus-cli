@@ -2,7 +2,8 @@ export type Role = 'user' | 'assistant' | 'system';
 
 export type ContentBlock = 
   | { type: 'text', text: string }
-  | { type: 'diff', path: string, diffText: string, language: string };
+  | { type: 'diff', path: string, diffText: string, language: string }
+  | { type: 'permission-request', calls: any[], status?: 'pending' | 'approved' | 'denied' };
 
 export interface UIMessage {
   id: string;

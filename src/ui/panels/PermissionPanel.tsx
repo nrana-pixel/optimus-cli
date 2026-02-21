@@ -70,39 +70,58 @@ export function PermissionPanel({ calls, onApprove, onDeny, onAlways, onFeedback
   return (
     <Box
       flexDirection="column"
-      paddingX={1}
-      paddingY={1}
-      borderStyle="single"
+      paddingX={2}
+      paddingY={0}
+      borderStyle="round"
       borderColor="yellow"
       width="100%"
+      marginY={1}
     >
-      <Box marginBottom={1}>
-        <Text bold color="yellow">Permission Required</Text>
+      <Box flexDirection="row" justifyContent="space-between">
+        <Box>
+          <Text bold color="black" backgroundColor="yellow">  🛡️ PERMISSION REQUIRED  </Text>
+          <Box marginLeft={1}>
+            <Text dimColor italic>Security Checkpoint</Text>
+          </Box>
+        </Box>
       </Box>
 
-      <Text>Optimus wants to use these tools:</Text>
-      
+      <Box marginTop={1}>
+        <Text>Optimus is requesting access to execute the following tools:</Text>
+      </Box>
+
       <Box flexDirection="column" marginY={1}>
         {calls.map((call, i) => (
           <Box key={i} marginLeft={2}>
-            <Text color="cyan">→ {call.name}</Text>
-            <Text dimColor> ({JSON.stringify(call.args).slice(0, 80)}{JSON.stringify(call.args).length > 80 ? '...' : ''})</Text>
+            <Text color="cyan">λ </Text>
+            <Text bold color="white">{call.name}</Text>
+            <Text dimColor> {Object.keys(call.args).length > 0 ? `(${JSON.stringify(call.args).slice(0, 100)}${JSON.stringify(call.args).length > 100 ? '...' : ''})` : '()'} </Text>
           </Box>
         ))}
       </Box>
 
-      <Box marginTop={1} flexDirection="column">
+      <Box marginTop={1} paddingY={1} borderStyle="single" borderTop={true} borderBottom={false} borderLeft={false} borderRight={false} borderColor="yellow" justifyContent="space-between">
+        <Box flexDirection="row">
+          <Box marginRight={2}>
+            <Text bold color="green">[Y]</Text>
+            <Text> Approve</Text>
+          </Box>
+          <Box marginRight={2}>
+            <Text bold color="red">[N]</Text>
+            <Text> Deny</Text>
+          </Box>
+          <Box marginRight={2}>
+            <Text bold color="blue">[A]</Text>
+            <Text> Always Allow</Text>
+          </Box>
+          <Box>
+            <Text bold color="yellow">[F]</Text>
+            <Text> Feedback</Text>
+          </Box>
+        </Box>
         <Box>
-          <Text>[<Text color="green" bold>Y</Text>]es, allow </Text>
-          <Text>  [<Text color="red" bold>N</Text>]o, deny </Text>
+          <Text dimColor>Esc to Deny • Enter to Approve</Text>
         </Box>
-        <Box marginTop={0.5}>
-          <Text>[<Text color="blue" bold>A</Text>]llow for this session </Text>
-          <Text>  [<Text color="yellow" bold>F</Text>]eedback (deny and tell why)</Text>
-        </Box>
-      </Box>
-      <Box marginTop={1}>
-        <Text dimColor>(Shortcut: Y/N/A/F or Enter for Yes, Esc for No)</Text>
       </Box>
     </Box>
   );

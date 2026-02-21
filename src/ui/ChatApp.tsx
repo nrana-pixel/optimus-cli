@@ -34,6 +34,8 @@ import { CommandPalette, type PaletteCommand } from './CommandPalette.js';
 import { SlashCommandOverlay } from './SlashCommandOverlay.js';
 import { Toasts } from './Toasts.js';
 import { useTheme } from './Theme.js';
+import { StatusIndicator } from './StatusIndicator.js';
+import { TurnSeparator } from './TurnSeparator.js';
 
 export interface ChatAppProps {
   initialMessages: UIMessage[];
@@ -72,6 +74,8 @@ export interface ChatAppProps {
     provider: string;
     isGenerating: boolean;
     pendingPermission: { calls: any[], resolve: (v: import('../chat/chat-engine.js').PermissionResult) => void } | null;
+    branch?: string;
+    cwd?: string;
   };
 }
 function getTextFromContent(content: UIMessage['content']): string {
@@ -125,6 +129,7 @@ export function ChatApp(props: ChatAppProps) {
   const [branchMapOpen, setBranchMapOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [elapsedSecs, setElapsedSecs] = useState(0);
 
   const { stdout } = useStdout();
   const [height, setHeight] = useState(stdout.rows);
@@ -144,6 +149,17 @@ export function ChatApp(props: ChatAppProps) {
       stdout.off('resize', onResize);
     };
   }, [stdout]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (state.isGenerating) {
+      setElapsedSecs(0);
+      interval = setInterval(() => {
+        setElapsedSecs((s) => s + 1);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [state.isGenerating]);
 
   // Reserve space for header + prompt/status area. Keep this tight to avoid huge blank regions.
   let usableHeight = Math.max(10, height - 4);
@@ -202,6 +218,7 @@ export function ChatApp(props: ChatAppProps) {
 
   useInput(async (ch, key) => {
     if (key.ctrl && ch === 'c') exit();
+    if (anyModal && !key.escape) return;
 
     // global palette (only when input is empty to avoid hijacking normal typing like paths)
     if (!paletteOpen && !searchOpen && !exportOpen && !settingsOpen && ch === '/' && input.trim().length === 0) {
@@ -374,6 +391,8 @@ export function ChatApp(props: ChatAppProps) {
         planMode={state.planMode}
         themeName={state.themeName}
         columns={columns}
+        branch={state.branch}
+        cwd={state.cwd}
       />
 
       {anchorMessageId ? (
@@ -504,6 +523,9 @@ export function ChatApp(props: ChatAppProps) {
 
         <ToolPanel tools={state.tools} />
         <DiffPanel diffs={state.diffs} />
+        {state.isGenerating && (
+          <StatusIndicator isRunning={true} header="Optimus is busy" elapsedSecs={elapsedSecs} />
+        )}
       </Box>
 
       {paletteOpen ? (
@@ -873,7 +895,7 @@ export function ChatApp(props: ChatAppProps) {
           />
         </Box>
         <Toasts toasts={state.toasts} />
-        <StatusBar hint={dynamicHint} isGenerating={state.isGenerating} />
+        <StatusBar hint={dynamicHint} isGenerating={false} />
       </Box>
     </Box>
   );
