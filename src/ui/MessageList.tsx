@@ -1,14 +1,15 @@
 import React, { useMemo } from 'react';
 import { Box, Text } from 'ink';
 import type { UIMessage, ContentBlock } from './types.js';
-import { useTheme } from './Theme.js';
+import { useTheme, type Theme } from './Theme.js';
 import { InlineDiffView } from './InlineDiffView.js';
 import { TurnSeparator } from './TurnSeparator.js';
+import { Typewriter } from './components/Typewriter.js';
 
-function roleLabel(theme: ReturnType<typeof useTheme>, role: UIMessage['role']) {
-  if (role === 'user') return { label: '● YOU', color: 'white' };
-  if (role === 'assistant') return { label: '● OPTIMUS', color: 'green' };
-  return { label: '● SYSTEM', color: 'gray' };
+function roleLabel(theme: Theme, role: UIMessage['role']) {
+  if (role === 'user') return { label: '● YOU', color: theme.user };
+  if (role === 'assistant') return { label: '● OPTIMUS', color: theme.assistant };
+  return { label: '● SYSTEM', color: theme.dim };
 }
 
 function renderPermissionRequest(block: Extract<ContentBlock, { type: 'permission-request' }>) {
@@ -30,11 +31,15 @@ function renderPermissionRequest(block: Extract<ContentBlock, { type: 'permissio
   );
 }
 
-function renderContent(block: ContentBlock) {
+function renderContent(theme: Theme, block: ContentBlock, animate: boolean = false) {
   if (block.type === 'text') {
     return (
       <Box paddingLeft={2}>
-        <Text>{block.text}</Text>
+        {animate ? (
+          <Typewriter text={block.text} speed={5} />
+        ) : (
+          <Text color={theme.text as any}>{block.text}</Text>
+        )}
       </Box>
     );
   }
@@ -51,12 +56,22 @@ export function MessageList(props: {
   messages: UIMessage[];
   compactMode: boolean;
   anchorMessageId?: string | null;
+  focusedId?: string | null;
   maxMessages?: number;
   columns: number;
 }) {
   const theme = useTheme();
-  const { messages, compactMode, maxMessages = 200, anchorMessageId } = props;
+  const { messages, compactMode, maxMessages = 200, anchorMessageId, focusedId } = props;
   const visible = useMemo(() => messages.slice(-maxMessages), [messages, maxMessages]);
+
+  const animatedIds = React.useRef(new Set<string>());
+  const lastMsgId = visible[visible.length - 1]?.id;
+
+  React.useEffect(() => {
+    if (lastMsgId) {
+      // Just mark existing but we'll check in render
+    }
+  }, [lastMsgId]);
 
   return (
     <Box flexDirection="column">
@@ -83,13 +98,28 @@ export function MessageList(props: {
                 <Text dimColor>{reactions}</Text>
                 {m.editedAt ? <Text dimColor>{' (edited)'}</Text> : null}
                 {isAnchor && <Text color="yellow"> [FOCUS]</Text>}
+                {focusedId === m.id && (
+                  <Box marginLeft={1}>
+                    <Text color={theme.accent as any} dimColor>[C] Copy</Text>
+                  </Box>
+                )}
               </Box>
               <Box flexDirection="column" marginTop={0}>
-                {m.content.map((block, i) => (
-                  <Box key={i} flexDirection="column">
-                    {renderContent(block)}
-                  </Box>
-                ))}
+                {m.content.map((block, i) => {
+                  const isLatestAssistant = m.role === 'assistant' && m.id === lastMsgId;
+                  const shouldAnimate = isLatestAssistant && !m.isPartial && !animatedIds.current.has(m.id);
+
+                  if (shouldAnimate && i === m.content.length - 1) {
+                    // We only mark it as animated once it starts
+                    animatedIds.current.add(m.id);
+                  }
+
+                  return (
+                    <Box key={i} flexDirection="column">
+                      {renderContent(theme, block, shouldAnimate)}
+                    </Box>
+                  );
+                })}
               </Box>
             </Box>
           </React.Fragment>

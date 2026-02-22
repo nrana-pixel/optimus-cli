@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text } from 'ink';
 import { ChatApp } from '../ChatApp.js';
-import { ThemeProvider } from '../Theme.js';
+import { ThemeProvider, type ThemeName } from '../Theme.js';
 import { type FileDiff, type ToolRun, type UIMessage, getTextFromContent } from '../types.js';
 import type { Toast } from '../Toasts.js';
 import type { SessionListItem } from '../panels/SessionsPanel.js';
@@ -10,12 +10,16 @@ import type { GlobalSearchHit } from '../panels/SearchAllPanel.js';
 import { readFileSync, existsSync } from 'fs';
 import { ChatEngine } from '../../chat/chat-engine.js';
 import { ConfigService } from '../../services/config.service.js';
+import { PilotService } from '../../services/pilot.service.js';
+import { AuditorService, AuditFinding } from '../../services/auditor.service.js';
+import { resolve } from 'path';
 
 /**
  * Ink UI Controller
  */
 export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) {
   const engineRef = useRef<ChatEngine | null>(null);
+  const auditorServiceRef = useRef<AuditorService | null>(null);
   const [initialPromptHandled, setInitialPromptHandled] = useState(false);
 
   const [messages, setMessages] = useState<UIMessage[]>([]);
@@ -32,7 +36,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const [cost, setCost] = useState(0);
   const [model, setModel] = useState('');
   const [sessionName, setSessionName] = useState('');
-  const [themeName, setThemeName] = useState<'dark' | 'light' | 'high-contrast'>('dark');
+  const [themeName, setThemeName] = useState<ThemeName>('moon');
   const [savedThreadRootId, setSavedThreadRootId] = useState<string | null>(null);
   const [savedThreadLeafId, setSavedThreadLeafId] = useState<string | null>(null);
   const [recentCommands, setRecentCommands] = useState<string[]>([]);
@@ -43,6 +47,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const [toolsEnabled, setToolsEnabled] = useState(true);
   const [planMode, setPlanMode] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [step, setStep] = useState('');
   const [queue, setQueue] = useState<string[]>([]);
   const [pendingPermission, setPendingPermission] = useState<{ calls: any[], previews?: FileDiff[], resolve: (v: import('../../chat/chat-engine.js').PermissionResult) => void } | null>(null);
 
@@ -72,6 +77,30 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     if (engineRef.current) return engineRef.current;
     const engine = new ChatEngine();
     engineRef.current = engine;
+    const onMsg = (m: UIMessage) => {
+      setMessages((prev) => {
+        const idx = prev.findIndex((x) => x.id === m.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = { ...m, isPartial: false };
+          return next;
+        }
+        return [...prev, { ...m, isPartial: false }];
+      });
+    };
+
+    const onPartialMsg = (m: UIMessage) => {
+      setMessages((prev) => {
+        const idx = prev.findIndex((x) => x.id === m.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = { ...m, isPartial: true };
+          return next;
+        }
+        return [...prev, { ...m, isPartial: true }];
+      });
+    };
+
     await engine.initForInkUI({
       onState: (s: any) => {
         setTokens(s.tokens);
@@ -81,25 +110,10 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
         setToolsEnabled(s.toolsEnabled);
         setPlanMode(s.planMode);
         if (s.provider) setProvider(s.provider);
+        if (s.step !== undefined) setStep(s.step);
       },
-      onMessage: (m: UIMessage) => setMessages((prev) => {
-        const idx = prev.findIndex(item => item.id === m.id);
-        if (idx >= 0) {
-          const next = [...prev];
-          next[idx] = m;
-          return next;
-        }
-        return [...prev, m];
-      }),
-      onPartialMessage: (m: UIMessage) => setMessages((prev) => {
-        const idx = prev.findIndex(item => item.id === m.id);
-        if (idx >= 0) {
-          const next = [...prev];
-          next[idx] = { ...next[idx], content: m.content };
-          return next;
-        }
-        return [...prev, m];
-      }),
+      onMessage: onMsg,
+      onPartialMessage: onPartialMsg,
       onTools: (t: ToolRun[]) => setTools(t),
       onDiffs: (d: FileDiff[]) => {
         setDiffs(d);
@@ -122,9 +136,9 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     try {
       const s = engine.conv.getCurrentSession();
       if (s) {
-        s.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
+        s.settings ??= { theme: 'moon', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
         const t = s.settings.theme;
-        if (t === 'dark' || t === 'light' || t === 'high-contrast') setThemeName(t);
+        if (t === 'sun' || t === 'moon' || t === 'universe') setThemeName(t as ThemeName);
         setSavedThreadRootId(s.settings.threadRootId ?? null);
         setSavedThreadLeafId(s.settings.threadLeafId ?? null);
         setRecentCommands(s.settings.recentCommands ?? []);
@@ -157,7 +171,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     const engine = await ensureEngine();
     const session = engine.getCurrentSession();
     if (!session) return;
-    session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {} };
+    session.settings ??= { theme: 'moon', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {} };
     session.settings.usage ??= {};
     session.settings.usage[key] = (session.settings.usage[key] ?? 0) + 1;
     setUsage({ ...session.settings.usage });
@@ -278,6 +292,33 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     const engine = await ensureEngine();
     await archiveIfTooLarge(engine as any);
 
+    if (text.startsWith('/settings ')) {
+      const parts = text.split(' ');
+      const newTheme = parts[1] as any;
+      const isCompact = parts[2] === 'compact';
+      const showLines = parts[3] === 'lines';
+
+      setThemeName(newTheme);
+      const session = engine.getCurrentSession();
+      if (session) {
+        session.settings ??= { theme: 'moon', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
+        session.settings.theme = newTheme;
+        session.settings.compactMode = isCompact;
+        session.settings.showLineNumbers = showLines;
+        engine.saveSession();
+      }
+      return;
+    }
+
+    if (text.startsWith('/toast ')) {
+      const parts = text.split(' ');
+      const type = parts[1] as any;
+      const messageMatch = text.match(/"([^"]+)"/);
+      const message = messageMatch ? messageMatch[1] : parts.slice(2).join(' ');
+      pushToast(type, message);
+      return;
+    }
+
     if (text.startsWith('/load-session ')) {
       const id = text.replace('/load-session', '').trim();
       const loaded = engine.loadSession(id);
@@ -291,6 +332,70 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
         await refreshSessions();
         pushToast('success', `Loaded: ${loaded.name}`);
       } else pushToast('error', 'Failed to load');
+      return;
+    }
+
+    if (text.trim() === '/audit-start') {
+      if (auditorServiceRef.current) {
+        pushToast('info', 'Auditor is already running');
+        return;
+      }
+      const auditor = new AuditorService();
+      auditorServiceRef.current = auditor;
+      const workingDir = resolve('.');
+      auditor.start(workingDir, (findings) => {
+        findings.forEach(f => {
+          pushToast(f.severity === 'high' ? 'error' : 'warn', `Audit: ${f.filePath.split(/[\\/]/).pop()}: ${f.finding}`);
+        });
+      });
+      pushToast('success', 'Background Security & Performance Auditor started');
+      return;
+    }
+
+    if (text.trim() === '/audit-stop') {
+      if (auditorServiceRef.current) {
+        auditorServiceRef.current.stop();
+        auditorServiceRef.current = null;
+        pushToast('info', 'Auditor stopped');
+      }
+      return;
+    }
+
+    if (text.trim() === '/sync') {
+      pushToast('info', 'Syncing sessions with Git...');
+      try {
+        const { homedir } = await import('os');
+        const { join } = await import('path');
+        const { simpleGit } = await import('simple-git');
+
+        const sessionsDir = join(homedir(), '.multi-agent', 'sessions');
+        const git = simpleGit(sessionsDir);
+
+        const isRepo = await git.checkIsRepo();
+        if (!isRepo) {
+          await git.init();
+          // Add default config if none
+          await git.addConfig('user.email', 'optimus@local');
+          await git.addConfig('user.name', 'Optimus Agent');
+          pushToast('info', `Initialized git repo in ${sessionsDir}.`);
+        }
+
+        await git.add('.');
+        const status = await git.status();
+        if (!status.isClean()) {
+          await git.commit(`Backup sessions ${new Date().toISOString()}`);
+        }
+
+        const remotes = await git.getRemotes();
+        if (remotes.length > 0) {
+          await git.push();
+          pushToast('success', 'Sessions saved and pushed to remote.');
+        } else {
+          pushToast('success', `Sessions committed locally. To push to cloud, add a git remote in ${sessionsDir}`);
+        }
+      } catch (err: any) {
+        pushToast('error', `Sync failed: ${err.message}`);
+      }
       return;
     }
 
@@ -326,7 +431,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
       const cmdText = text.replace('/recent-cmd', '').trim();
       const session = engine.getCurrentSession();
       if (session) {
-        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
+        session.settings ??= { theme: 'moon', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
         const rc = session.settings.recentCommands || [];
         session.settings.recentCommands = [cmdText, ...rc.filter(x => x !== cmdText)].slice(0, 20);
         setRecentCommands(session.settings.recentCommands);
@@ -339,7 +444,7 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
     if (text.startsWith('/') && !text.startsWith('/load-session') && !text.startsWith('/search-all') && !text.startsWith('/mode')) {
       const session = engine.getCurrentSession();
       if (session) {
-        session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
+        session.settings ??= { theme: 'moon', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null };
         const rc = session.settings.recentCommands || [];
         session.settings.recentCommands = [text, ...rc.filter(x => x !== text)].slice(0, 20);
         setRecentCommands(session.settings.recentCommands);
@@ -364,6 +469,15 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
       onSubmit(initialPrompt);
     }
   }, [initialPrompt, initialPromptHandled, isGenerating, onSubmit]);
+
+  // Clean up auditor service on unmount
+  useEffect(() => {
+    return () => {
+      if (auditorServiceRef.current) {
+        auditorServiceRef.current.stop();
+      }
+    };
+  }, []);
 
   const onRegenerateLast = useCallback(async () => {
     const engine = await ensureEngine();
@@ -397,8 +511,8 @@ export function ChatUIController({ initialPrompt }: { initialPrompt?: string }) 
   const onFeedbackTools = useCallback((text: string) => { if (pendingPermission) { pendingPermission.resolve({ type: 'feedback', text }); setPendingPermission(null); } }, [pendingPermission]);
 
   const getRuntimeState = useCallback(() => ({
-    tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission, branch, cwd,
-  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, pendingPermission, branch, cwd]);
+    tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, step, pendingPermission, branch, cwd,
+  }), [tokens, cost, toolsEnabled, planMode, tools, diffs, diffGroups, snapshotGroups, messages, sessions, globalHits, toasts, themeName, savedThreadRootId, savedThreadLeafId, recentCommands, usage, provider, isGenerating, step, pendingPermission, branch, cwd]);
 
   const ready = useMemo(() => Boolean(model), [model]);
 

@@ -24,6 +24,7 @@ import { PruneBranchPanel } from './panels/PruneBranchPanel.js';
 import { BranchMapPanel } from './panels/BranchMapPanel.js';
 import { ImportSessionPanel } from './panels/ImportSessionPanel.js';
 import { HelpOverlayPanel } from './panels/HelpOverlayPanel.js';
+import { MultiLineEditPanel } from './panels/MultiLineEditPanel.js';
 import { PermissionPanel } from './panels/PermissionPanel.js';
 import { PromptInput } from './PromptInput.js';
 import { HeaderBar } from './HeaderBar.js';
@@ -36,6 +37,7 @@ import { Toasts } from './Toasts.js';
 import { useTheme } from './Theme.js';
 import { StatusIndicator } from './StatusIndicator.js';
 import { TurnSeparator } from './TurnSeparator.js';
+import { copyToClipboard } from '../utils/clipboard.js';
 
 export interface ChatAppProps {
   initialMessages: UIMessage[];
@@ -73,6 +75,7 @@ export interface ChatAppProps {
     usage: Record<string, number>;
     provider: string;
     isGenerating: boolean;
+    step: string;
     pendingPermission: { calls: any[], previews?: FileDiff[], resolve: (v: import('../chat/chat-engine.js').PermissionResult) => void } | null;
     branch?: string;
     cwd?: string;
@@ -129,6 +132,9 @@ export function ChatApp(props: ChatAppProps) {
   const [branchMapOpen, setBranchMapOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [multiLineOpen, setMultiLineOpen] = useState(false);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [historyTemp, setHistoryTemp] = useState('');
   const [elapsedSecs, setElapsedSecs] = useState(0);
 
   const { stdout } = useStdout();
@@ -137,7 +143,7 @@ export function ChatApp(props: ChatAppProps) {
   const state = props.getRuntimeState();
 
   const [settings, setSettings] = useState<UISettings>({
-    theme: 'dark',
+    theme: 'moon',
     compactMode: false,
     showLineNumbers: false,
   });
@@ -200,17 +206,25 @@ export function ChatApp(props: ChatAppProps) {
 
   const anyModal = paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || toolRunsOpen || siblingsOpen || tagOpen || editAssistantOpen || deleteMsgOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen;
 
+  const focusedId = useMemo(() => {
+    if (viewMessages.length === 0) return null;
+    const idx = Math.max(0, viewMessages.length - 1 - scrollOffset);
+    return viewMessages[idx]?.id;
+  }, [viewMessages, scrollOffset]);
+
   const dynamicHint = useMemo(() => {
     if (state.pendingPermission) return 'Select an option or Esc to deny.';
     if (diffReviewOpen) return 'Esc or Ctrl+T to return to chat. Use ↑/↓ to browse files.';
     if (anyModal) return 'Esc to close overlay, ↑/↓ to navigate, Enter to select.';
-    return 'Ctrl+T Diffs · Ctrl+F Search · / Commands · ? Help · ↑↓ Scroll · Ctrl+C Exit';
+    return '↑↓ History · Shift+↑↓ Scroll · C Copy · / Commands · Ctrl+E Multi-line · ? Help';
   }, [state.pendingPermission, anyModal, diffReviewOpen]);
 
   const submit = useCallback(async () => {
     const v = input.trim();
     if (!v) return;
     setInput('');
+    setHistoryIndex(-1);
+    setHistoryTemp('');
     setAnchorMessageId(null);
     await props.onSubmit(v);
   }, [input, props]);
@@ -227,10 +241,47 @@ export function ChatApp(props: ChatAppProps) {
 
     // panels
     if (key.ctrl && ch === 'f') setSearchOpen(true);
+    if (key.ctrl && ch === 'e') setMultiLineOpen(true);
 
-    // Scrolling (Qodo-like): Up/Down when no overlay is open
-    if (!anyModal && (key.upArrow || key.downArrow || (key as any).wheelUp || (key as any).wheelDown)) {
-      const delta = key.upArrow || (key as any).wheelUp ? 1 : -1;
+    // copy
+    if (!anyModal && (ch === 'c' || ch === 'C') && input.length === 0) {
+      const msg = viewMessages.find(m => m.id === focusedId);
+      if (msg) {
+        const textToCopy = msg.content.map(b => b.type === 'text' ? b.text : '').join('\n');
+        const ok = await copyToClipboard(textToCopy);
+        if (ok) {
+          const { pushToast } = props as any; // Hook into toast if possible, otherwise we set toast in state which is local
+          // We have Toasts component but the state is in the runtime? No, state.toasts comes from runtime.
+          // Let's use the local refresh/toast mechanism or just assume it works.
+          // Wait, the runtime handles toasts. We need a way to push toast.
+          // props.onSubmit could be used? No.
+          await props.onSubmit(`/toast info "Message copied to clipboard"`);
+        }
+      }
+    }
+
+    // History Navigation
+    if (!anyModal && !paletteOpen && (key.upArrow || key.downArrow) && !key.shift) {
+      const history = state.recentCommands || [];
+      if (history.length === 0) return;
+
+      if (key.upArrow) {
+        if (historyIndex === -1) setHistoryTemp(input);
+        const next = Math.min(historyIndex + 1, history.length - 1);
+        setHistoryIndex(next);
+        setInput(history[next]);
+      } else {
+        const next = Math.max(historyIndex - 1, -1);
+        setHistoryIndex(next);
+        if (next === -1) setInput(historyTemp);
+        else setInput(history[next]);
+      }
+      return;
+    }
+
+    // Scrolling (Qodo-like): Shift+Up/Down when no overlay is open
+    if (!anyModal && ((key.shift && (key.upArrow || key.downArrow)) || (key as any).wheelUp || (key as any).wheelDown)) {
+      const delta = (key.upArrow || (key as any).wheelUp) ? 1 : -1;
       setScrollOffset((o) => {
         // scrollOffset: 0 = bottom/newest, increase to move up/older
         const max = Math.max(0, viewMessages.length - 1);
@@ -378,522 +429,561 @@ export function ChatApp(props: ChatAppProps) {
     { id: 'analytics', title: 'Analytics', value: '/analytics', description: 'Session stats and insights', category: 'Insights', example: '/analytics' },
     { id: 'search-all', title: 'Search all sessions', value: '/search-all', description: 'Search across saved sessions', category: 'Navigation', example: '/search-all "query"' },
     { id: 'help-ui', title: 'Help', value: '/help-ui', description: 'Keyboard shortcuts and help', category: 'General', example: '/help-ui' },
+    { id: 'pilot', title: 'Start Pilot Mode', value: '/pilot', description: 'Start proactive AI pair programming (watches files)', category: 'Agent', example: '/pilot <aim>' },
+    { id: 'pilot-stop', title: 'Stop Pilot Mode', value: '/pilot-stop', description: 'Stop the active Pilot watcher', category: 'Agent', example: '/pilot-stop' },
+    { id: 'audit-start', title: 'Start Auditor', value: '/audit-start', description: 'Start background security & performance auditing', category: 'Agent', example: '/audit-start' },
+    { id: 'audit-stop', title: 'Stop Auditor', value: '/audit-stop', description: 'Stop the active Auditor', category: 'Agent', example: '/audit-stop' },
+    { id: 'sandbox', title: 'UI Sandbox', value: '/sandbox', description: 'Instant React UI prototyping environment', category: 'Agent', example: '/sandbox A sleek login form' },
+    { id: 'index-semantic', title: 'Index (Semantic)', value: '/index-semantic', description: 'Build semantic embeddings for RAG', category: 'Agent', example: '/index-semantic' },
+    { id: 'issue', title: 'GitHub Issue', value: '/issue', description: 'Fetch and solve a GitHub issue from URL', category: 'Agent', example: '/issue https://github.com/owner/repo/issues/1' },
+    { id: 'attach', title: 'Attach Image', value: '/attach', description: 'Attach an image to the prompt', category: 'Message', example: '/attach ./image.png Describe this' },
+    { id: 'sync', title: 'Sync Sessions (Git)', value: '/sync', description: 'Backup your session history to git/cloud', category: 'General', example: '/sync' },
+    { id: 'test-driven', title: 'Test-Driven Loop', value: '/test-driven', description: 'Auto-run tests & fix code until green', category: 'Agent', example: '/test-driven "npm test" Fix auth' },
+    { id: 'swarm', title: 'Swarm Agents', value: '/swarm', description: 'Deploy Planner, Coder, and Reviewer agents', category: 'Agent', example: '/swarm Build a login page' },
+    { id: 'voice', title: 'Voice to Code', value: '/voice', description: 'Record voice prompt and transcribe', category: 'Agent', example: '/voice' },
+    { id: 'deploy', title: 'Deploy App', value: '/deploy', description: 'Deploy to AWS, Vercel, GCP, or K8s', category: 'Agent', example: '/deploy vercel' },
+    { id: 'env-sync', title: 'Sync Secrets', value: '/env-sync', description: 'Sync local .env with Cloud secrets', category: 'Agent', example: '/env-sync vercel production' },
     { id: 'exit', title: 'Exit', value: '/exit', description: 'Quit', category: 'General', example: '/exit' },
   ];
 
   return (
     <Box flexDirection="column" overflow="hidden">
-      <HeaderBar
-        model={props.model}
-        sessionName={props.sessionName}
-        provider={state.provider}
-        toolsEnabled={state.toolsEnabled}
-        planMode={state.planMode}
-        themeName={state.themeName}
-        columns={columns}
-        branch={state.branch}
-        cwd={state.cwd}
-      />
+      <Box flexDirection="column">
+        <HeaderBar
+          model={props.model}
+          sessionName={props.sessionName}
+          provider={state.provider}
+          toolsEnabled={state.toolsEnabled}
+          planMode={state.planMode}
+          themeName={state.themeName}
+          columns={columns}
+          branch={state.branch}
+          cwd={state.cwd}
+        />
 
-      {anchorMessageId ? (
-        <Box paddingX={1} marginTop={1} display={anyModal ? 'none' : 'flex'}>
-          <Text dimColor italic>
-            ● Focus mode: Ctrl+Z to return · Ctrl+Shift+N/P to cycle
-          </Text>
-        </Box>
-      ) : null}
-
-      <Box flexDirection="column" display={anyModal ? 'none' : 'flex'}>
-        {viewMessages.length === 0 ? (
-          <Box marginX={1} marginTop={1} flexShrink={0}>
-            <Text dimColor>● Quick start: </Text>
-            <Text color="cyan">summarize</Text>
-            <Text dimColor> · </Text>
-            <Text color="cyan">bugs</Text>
-            <Text dimColor> · </Text>
-            <Text color="cyan">tests</Text>
-            <Text dimColor>  (Type / for commands)</Text>
+        {anchorMessageId ? (
+          <Box paddingX={1} marginTop={1} display={anyModal ? 'none' : 'flex'}>
+            <Text dimColor italic>
+              ● Focus mode: Ctrl+Z to return · Ctrl+Shift+N/P to cycle
+            </Text>
           </Box>
         ) : null}
-        {(() => {
-          if (anchorMessageId) {
-            const idx = viewMessages.findIndex((m) => m.id === anchorMessageId);
-            if (idx >= 0) {
-              const slice: UIMessage[] = [];
-              let currentHeight = 0;
-              const anchorM = viewMessages[idx];
-              currentHeight += getMessageHeight(anchorM, columns, settings.compactMode);
-              slice.push(anchorM);
 
-              let upIdx = idx - 1;
-              let downIdx = idx + 1;
-              while (currentHeight < usableHeight && (upIdx >= 0 || downIdx < viewMessages.length)) {
-                if (upIdx >= 0) {
-                  const m = viewMessages[upIdx];
-                  const h = getMessageHeight(m, columns, settings.compactMode);
-                  if (currentHeight + h <= usableHeight) {
-                    currentHeight += h;
-                    slice.unshift(m);
-                    upIdx--;
-                  } else upIdx = -1;
+        <Box flexDirection="column" display={anyModal ? 'none' : 'flex'}>
+          {viewMessages.length === 0 ? (
+            <Box marginX={1} marginTop={1} flexShrink={0}>
+              <Text dimColor>● Quick start: </Text>
+              <Text color="cyan">summarize</Text>
+              <Text dimColor> · </Text>
+              <Text color="cyan">bugs</Text>
+              <Text dimColor> · </Text>
+              <Text color="cyan">tests</Text>
+              <Text dimColor>  (Type / for commands)</Text>
+            </Box>
+          ) : null}
+          {(() => {
+            if (anchorMessageId) {
+              const idx = viewMessages.findIndex((m) => m.id === anchorMessageId);
+              if (idx >= 0) {
+                const slice: UIMessage[] = [];
+                let currentHeight = 0;
+                const anchorM = viewMessages[idx];
+                currentHeight += getMessageHeight(anchorM, columns, settings.compactMode);
+                slice.push(anchorM);
+
+                let upIdx = idx - 1;
+                let downIdx = idx + 1;
+                while (currentHeight < usableHeight && (upIdx >= 0 || downIdx < viewMessages.length)) {
+                  if (upIdx >= 0) {
+                    const m = viewMessages[upIdx];
+                    const h = getMessageHeight(m, columns, settings.compactMode);
+                    if (currentHeight + h <= usableHeight) {
+                      currentHeight += h;
+                      slice.unshift(m);
+                      upIdx--;
+                    } else upIdx = -1;
+                  }
+                  if (currentHeight < usableHeight && downIdx < viewMessages.length) {
+                    const m = viewMessages[downIdx];
+                    const h = getMessageHeight(m, columns, settings.compactMode);
+                    if (currentHeight + h <= usableHeight) {
+                      currentHeight += h;
+                      slice.push(m);
+                      downIdx++;
+                    } else downIdx = viewMessages.length;
+                  }
                 }
-                if (currentHeight < usableHeight && downIdx < viewMessages.length) {
-                  const m = viewMessages[downIdx];
-                  const h = getMessageHeight(m, columns, settings.compactMode);
-                  if (currentHeight + h <= usableHeight) {
-                    currentHeight += h;
-                    slice.push(m);
-                    downIdx++;
-                  } else downIdx = viewMessages.length;
-                }
-              }
-              const start = upIdx + 1;
-              return (
-                <>
-                  <MessageList
-                    messages={slice}
-                    compactMode={settings.compactMode}
-                    anchorMessageId={anchorMessageId}
-                    columns={columns}
-                  />
-                  {state.pendingPermission && (
-                    <PermissionPanel
-                      calls={state.pendingPermission.calls}
-                      onApprove={props.onApproveTools}
-                      onDeny={props.onDenyTools}
-                      onAlways={props.onAlwaysApprove}
-                      onFeedback={props.onFeedbackTools}
+                const start = upIdx + 1;
+                return (
+                  <>
+                    <MessageList
+                      messages={slice}
+                      compactMode={settings.compactMode}
+                      anchorMessageId={anchorMessageId}
+                      focusedId={focusedId}
+                      columns={columns}
                     />
-                  )}
-                </>
+                    {state.pendingPermission && (
+                      <PermissionPanel
+                        calls={state.pendingPermission.calls}
+                        onApprove={props.onApproveTools}
+                        onDeny={props.onDenyTools}
+                        onAlways={props.onAlwaysApprove}
+                        onFeedback={props.onFeedbackTools}
+                      />
+                    )}
+                  </>
+                );
+              }
+            }
+
+            const slice: UIMessage[] = [];
+            let currentHeight = 0;
+            let viewEnd = Math.max(0, viewMessages.length - scrollOffset);
+            let startIdx = viewEnd - 1;
+
+            while (startIdx >= 0) {
+              const m = viewMessages[startIdx];
+              const msgH = getMessageHeight(m, columns, settings.compactMode);
+              if (currentHeight + msgH > usableHeight && slice.length > 0) break;
+              currentHeight += msgH;
+              slice.unshift(m);
+              startIdx--;
+            }
+
+            // If we hit the top and haven't filled the screen, pull in newer messages
+            if (startIdx < 0 && currentHeight < usableHeight) {
+              let nextEnd = viewEnd;
+              while (nextEnd < viewMessages.length) {
+                const m = viewMessages[nextEnd];
+                const msgH = getMessageHeight(m, columns, settings.compactMode);
+                if (currentHeight + msgH > usableHeight) break;
+                currentHeight += msgH;
+                slice.push(m);
+                nextEnd++;
+              }
+            }
+
+            const start = Math.max(0, startIdx + 1);
+
+            if (diffReviewOpen) {
+              return (
+                <DiffReviewPanel
+                  diffs={selectedToolRunId ? (state.diffGroups[selectedToolRunId] ?? []) : state.diffs}
+                  onClose={() => setDiffReviewOpen(false)}
+                  onRevertFile={async (path) => {
+                    await props.onSubmit(`/revert-file ${path}`);
+                  }}
+                  onRevertAll={async () => {
+                    if (selectedToolRunId) await props.onSubmit(`/revert-run ${selectedToolRunId}`);
+                    else await props.onSubmit('/revert-all');
+                  }}
+                  onAccept={() => {
+                    if (selectedToolRunId) void props.onSubmit(`/accept-run ${selectedToolRunId}`);
+                    else void props.onSubmit('/accept-diffs');
+                    setDiffReviewOpen(false);
+                  }}
+                />
               );
             }
-          }
 
-          const slice: UIMessage[] = [];
-          let currentHeight = 0;
-          let viewEnd = Math.max(0, viewMessages.length - scrollOffset);
-          let startIdx = viewEnd - 1;
-
-          while (startIdx >= 0) {
-            const m = viewMessages[startIdx];
-            const msgH = getMessageHeight(m, columns, settings.compactMode);
-            if (currentHeight + msgH > usableHeight && slice.length > 0) break;
-            currentHeight += msgH;
-            slice.unshift(m);
-            startIdx--;
-          }
-
-          // If we hit the top and haven't filled the screen, pull in newer messages
-          if (startIdx < 0 && currentHeight < usableHeight) {
-            let nextEnd = viewEnd;
-            while (nextEnd < viewMessages.length) {
-              const m = viewMessages[nextEnd];
-              const msgH = getMessageHeight(m, columns, settings.compactMode);
-              if (currentHeight + msgH > usableHeight) break;
-              currentHeight += msgH;
-              slice.push(m);
-              nextEnd++;
-            }
-          }
-
-          const start = Math.max(0, startIdx + 1);
-
-          if (diffReviewOpen) {
             return (
-              <DiffReviewPanel
-                diffs={selectedToolRunId ? (state.diffGroups[selectedToolRunId] ?? []) : state.diffs}
-                onClose={() => setDiffReviewOpen(false)}
-                onRevertFile={async (path) => {
-                  await props.onSubmit(`/revert-file ${path}`);
-                }}
-                onRevertAll={async () => {
-                  if (selectedToolRunId) await props.onSubmit(`/revert-run ${selectedToolRunId}`);
-                  else await props.onSubmit('/revert-all');
-                }}
-                onAccept={() => {
-                  if (selectedToolRunId) void props.onSubmit(`/accept-run ${selectedToolRunId}`);
-                  else void props.onSubmit('/accept-diffs');
-                  setDiffReviewOpen(false);
-                }}
-              />
-            );
-          }
-
-          return (
-            <>
-              <MessageList
-                messages={slice}
-                compactMode={settings.compactMode}
-                anchorMessageId={null}
-                columns={columns}
-              />
-              {state.pendingPermission && (
-                <PermissionPanel
-                  calls={state.pendingPermission.calls}
-                  previews={state.pendingPermission.previews}
-                  onApprove={props.onApproveTools}
-                  onDeny={props.onDenyTools}
-                  onAlways={props.onAlwaysApprove}
-                  onFeedback={props.onFeedbackTools}
+              <>
+                <MessageList
+                  messages={slice}
+                  compactMode={settings.compactMode}
+                  anchorMessageId={null}
+                  focusedId={focusedId}
+                  columns={columns}
                 />
-              )}
-            </>
-          );
-        })()}
-
-        <ToolPanel tools={state.tools} />
-        <DiffPanel diffs={state.diffs} />
-        {state.isGenerating && (
-          <StatusIndicator isRunning={true} header="Optimus is busy" elapsedSecs={elapsedSecs} />
-        )}
-      </Box>
-
-      {paletteOpen ? (
-        <CommandPalette
-          commands={commands}
-          recent={state.recentCommands}
-          onCancel={() => setPaletteOpen(false)}
-          onSelect={async (cmd) => {
-            setPaletteOpen(false);
-
-            // local-only commands
-            if (cmd === '/search') {
-              setSearchOpen(true);
-              return;
-            }
-            if (cmd === '/export') {
-              setExportOpen(true);
-              return;
-            }
-            if (cmd === '/settings') {
-              setSettingsOpen(true);
-              return;
-            }
-            if (cmd === '/sessions-ui') {
-              setSessionsOpen(true);
-              return;
-            }
-            if (cmd === '/pins') {
-              setPinsOpen(true);
-              return;
-            }
-            if (cmd === '/edit-last') {
-              setEditLastOpen(true);
-              return;
-            }
-            if (cmd === '/edit') {
-              setEditMessageOpen(true);
-              return;
-            }
-            if (cmd === '/analytics') {
-              setAnalyticsOpen(true);
-              return;
-            }
-            if (cmd === '/search-all') {
-              setSearchAllOpen(true);
-              return;
-            }
-            if (cmd === '/branch') {
-              setBranchOpen(true);
-              return;
-            }
-            if (cmd === '/thread-all') {
-              setThreadRootId(null);
-              return;
-            }
-            if (cmd === '/branches') {
-              setBranchesOpen(true);
-              return;
-            }
-            if (cmd === '/diffs') {
-              setToolRunsOpen(true);
-              return;
-            }
-            if (cmd === '/tags') {
-              setTagOpen(true);
-              return;
-            }
-            if (cmd === '/delete-msg') {
-              setDeleteMsgOpen(true);
-              return;
-            }
-            if (cmd === '/edit-asst') {
-              setEditAssistantOpen(true);
-              return;
-            }
-            if (cmd === '/prune-branch') {
-              setPruneBranchOpen(true);
-              return;
-            }
-            if (cmd === '/branch-map') {
-              setBranchMapOpen(true);
-              return;
-            }
-            if (cmd === '/import') {
-              setImportOpen(true);
-              return;
-            }
-            if (cmd === '/help-ui') {
-              setHelpOpen(true);
-              return;
-            }
-            if (cmd === '/regen') {
-              await props.onRegenerateLast();
-              return;
-            }
-
-            await props.onSubmit(cmd);
-          }}
-        />
-      ) : null}
-
-      {searchOpen ? (
-        <SearchPanel
-          messages={state.messages}
-          onClose={() => setSearchOpen(false)}
-          onJumpTo={(id, hits) => {
-            setSearchOpen(false);
-            if (!returnState) setReturnState({ scrollOffset, threadRootId, threadLeafId });
-            setAnchorMessageId(id);
-            if (hits?.length) {
-              setLastSearchHits(hits);
-              setLastSearchIndex(Math.max(0, hits.indexOf(id)));
-            }
-          }}
-        />
-      ) : null}
-
-      {exportOpen ? (
-        <ExportPanel
-          defaultPath={`./ ${props.sessionName}.md`}
-          onClose={() => setExportOpen(false)}
-          onExport={async (format, path) => {
-            await props.onSubmit(`/export-ui ${format} ${path}`);
-          }}
-        />
-      ) : null}
-
-      {settingsOpen ? (
-        <SettingsPanel
-          settings={settings}
-          onClose={() => setSettingsOpen(false)}
-          onUpdate={async (next) => {
-            setSettings(next);
-            await props.onSubmit(`/settings ${next.theme} ${next.compactMode ? 'compact' : 'normal'} ${next.showLineNumbers ? 'lines' : 'nolines'}`);
-          }}
-        />
-      ) : null}
-
-      {sessionsOpen ? (
-        <SessionsPanel
-          sessions={state.sessions}
-          onClose={() => setSessionsOpen(false)}
-          onLoad={async (id) => {
-            await props.onSubmit(`/load-session ${id}`);
-            setSessionsOpen(false);
-          }}
-          onDelete={async (id) => {
-            await props.onSubmit(`/delete-session ${id}`);
-          }}
-        />
-      ) : null}
-
-      {pinsOpen ? (
-        <PinsPanel
-          messages={state.messages}
-          onClose={() => setPinsOpen(false)}
-          onJumpTo={(id) => {
-            setPinsOpen(false);
-            setAnchorMessageId(id);
-          }}
-        />
-      ) : null}
-
-      {editLastOpen ? (
-        <EditLastPanel
-          initial={(() => {
-            const lastUser = [...state.messages].reverse().find((m) => m.role === 'user');
-            return lastUser ? getTextFromContent(lastUser.content) : '';
+                {state.pendingPermission && (
+                  <PermissionPanel
+                    calls={state.pendingPermission.calls}
+                    previews={state.pendingPermission.previews}
+                    onApprove={props.onApproveTools}
+                    onDeny={props.onDenyTools}
+                    onAlways={props.onAlwaysApprove}
+                    onFeedback={props.onFeedbackTools}
+                  />
+                )}
+              </>
+            );
           })()}
-          onClose={() => setEditLastOpen(false)}
-          onSubmit={async (newText) => {
-            await props.onSubmit(`/edit-last ${JSON.stringify(newText)}`);
-          }}
-        />
-      ) : null}
 
-      {editMessageOpen ? (
-        <EditMessagePanel
-          messages={state.messages}
-          onClose={() => setEditMessageOpen(false)}
-          onEditAndBranch={async (messageId, newContent) => {
-            await props.onSubmit(`/edit-branch ${messageId} ${JSON.stringify(newContent)}`);
-            setThreadRootId(messageId);
-          }}
-        />
-      ) : null}
+          <ToolPanel tools={state.tools} />
+          <DiffPanel diffs={state.diffs} />
+          {state.isGenerating && (
+            <StatusIndicator isRunning={true} header="Optimus is busy" elapsedSecs={elapsedSecs} />
+          )}
+        </Box>
 
-      {analyticsOpen ? (
-        <AnalyticsPanel
-          messages={state.messages}
-          tokens={state.tokens}
-          cost={state.cost}
-          tools={state.tools}
-          usage={state.usage}
-          model={props.model}
-          provider={state.provider}
-          onClose={() => setAnalyticsOpen(false)}
-        />
-      ) : null}
+        {paletteOpen ? (
+          <CommandPalette
+            commands={commands}
+            recent={state.recentCommands}
+            onCancel={() => setPaletteOpen(false)}
+            onSelect={async (cmd) => {
+              setPaletteOpen(false);
 
-      {searchAllOpen ? (
-        <SearchAllPanel
-          hits={state.globalHits}
-          onClose={() => setSearchAllOpen(false)}
-          onQuery={async (q) => {
-            await props.onSubmit(`/search-all ${JSON.stringify(q)}`);
-          }}
-          onSelect={async (hit) => {
-            await props.onSubmit(`/load-session ${hit.sessionId}`);
-            setAnchorMessageId(hit.messageId);
-            setSearchAllOpen(false);
-          }}
-        />
-      ) : null}
-
-      {branchOpen ? (
-        <BranchPanel
-          messages={state.messages}
-          onClose={() => setBranchOpen(false)}
-          onSelectParent={async (parentId) => {
-            await props.onSubmit(`/branch ${parentId}`);
-            setThreadRootId(parentId);
-          }}
-        />
-      ) : null}
-
-      {branchesOpen ? (
-        <BranchesPanel
-          messages={state.messages}
-          onClose={() => setBranchesOpen(false)}
-          onSelectThread={async (rootId) => {
-            setThreadRootId(rootId);
-            await props.onSubmit(`/thread-root ${rootId ?? ''}`);
-          }}
-        />
-      ) : null}
-
-      {toolRunsOpen ? (
-        <ToolRunDiffsPanel
-          diffGroups={state.diffGroups}
-          onClose={() => setToolRunsOpen(false)}
-          onSelectRun={(id) => {
-            setSelectedToolRunId(id);
-            setToolRunsOpen(false);
-            setDiffReviewOpen(true);
-          }}
-        />
-      ) : null}
-
-      {siblingsOpen && threadRootId ? (
-        <SiblingBranchesPanel
-          messages={state.messages}
-          parentId={threadRootId}
-          onClose={() => setSiblingsOpen(false)}
-          onSelectChild={async (childId) => {
-            setThreadLeafId(childId);
-            await props.onSubmit(`/thread-leaf ${childId}`);
-          }}
-        />
-      ) : null}
-
-      {tagOpen ? (
-        <TagPanel
-          messages={state.messages}
-          onClose={() => setTagOpen(false)}
-          onTag={async (id, tag) => props.onSubmit(`/tag-msg ${id} ${JSON.stringify(tag)}`)}
-          onUntag={async (id, tag) => props.onSubmit(`/untag-msg ${id} ${JSON.stringify(tag)}`)}
-        />
-      ) : null}
-
-      {deleteMsgOpen ? (
-        <DeleteMessagePanel
-          messages={state.messages}
-          onClose={() => setDeleteMsgOpen(false)}
-          onDelete={async (id) => {
-            await props.onSubmit(`/delete-msg ${id}`);
-          }}
-        />
-      ) : null}
-
-      {editAssistantOpen ? (
-        <EditAssistantPanel
-          messages={state.messages}
-          onClose={() => setEditAssistantOpen(false)}
-          onEdit={async (id, content) => {
-            await props.onSubmit(`/edit-asst ${id} ${JSON.stringify(content)}`);
-          }}
-        />
-      ) : null}
-
-      {pruneBranchOpen ? (
-        <PruneBranchPanel
-          messages={state.messages}
-          onClose={() => setPruneBranchOpen(false)}
-          onPrune={async (leafId) => {
-            await props.onSubmit(`/prune-branch ${leafId}`);
-          }}
-        />
-      ) : null}
-
-      {branchMapOpen ? (
-        <BranchMapPanel
-          messages={state.messages}
-          onClose={() => setBranchMapOpen(false)}
-          onSelectNode={async (id) => {
-            setAnchorMessageId(id);
-            setThreadRootId(id);
-            setThreadLeafId(null);
-            await props.onSubmit(`/thread-root ${id}`);
-            setBranchMapOpen(false);
-          }}
-        />
-      ) : null}
-
-      {importOpen ? (
-        <ImportSessionPanel
-          onClose={() => setImportOpen(false)}
-          onImport={async (p) => {
-            await props.onSubmit(`/import ${p}`);
-          }}
-        />
-      ) : null}
-
-      {helpOpen ? (
-        <HelpOverlayPanel onClose={() => setHelpOpen(false)} />
-      ) : null}
-
-      <Box flexDirection="column" flexShrink={0}>
-        {!anyModal && !diffReviewOpen && input.startsWith('/') && input.length > 1 && (
-          <SlashCommandOverlay query={input} commands={commands} />
-        )}
-        <Box marginTop={1} marginX={1}>
-          <PromptInput
-            value={input}
-            onChange={(v) => {
-              if (v === '?') {
-                setHelpOpen(!helpOpen);
+              // local-only commands
+              if (cmd === '/search') {
+                setSearchOpen(true);
                 return;
               }
-              setInput(v);
+              if (cmd === '/export') {
+                setExportOpen(true);
+                return;
+              }
+              if (cmd === '/settings') {
+                setSettingsOpen(true);
+                return;
+              }
+              if (cmd === '/sessions-ui') {
+                setSessionsOpen(true);
+                return;
+              }
+              if (cmd === '/pins') {
+                setPinsOpen(true);
+                return;
+              }
+              if (cmd === '/edit-last') {
+                setEditLastOpen(true);
+                return;
+              }
+              if (cmd === '/edit') {
+                setEditMessageOpen(true);
+                return;
+              }
+              if (cmd === '/analytics') {
+                setAnalyticsOpen(true);
+                return;
+              }
+              if (cmd === '/search-all') {
+                setSearchAllOpen(true);
+                return;
+              }
+              if (cmd === '/branch') {
+                setBranchOpen(true);
+                return;
+              }
+              if (cmd === '/thread-all') {
+                setThreadRootId(null);
+                return;
+              }
+              if (cmd === '/branches') {
+                setBranchesOpen(true);
+                return;
+              }
+              if (cmd === '/diffs') {
+                setToolRunsOpen(true);
+                return;
+              }
+              if (cmd === '/tags') {
+                setTagOpen(true);
+                return;
+              }
+              if (cmd === '/delete-msg') {
+                setDeleteMsgOpen(true);
+                return;
+              }
+              if (cmd === '/edit-asst') {
+                setEditAssistantOpen(true);
+                return;
+              }
+              if (cmd === '/prune-branch') {
+                setPruneBranchOpen(true);
+                return;
+              }
+              if (cmd === '/branch-map') {
+                setBranchMapOpen(true);
+                return;
+              }
+              if (cmd === '/import') {
+                setImportOpen(true);
+                return;
+              }
+              if (cmd === '/help-ui') {
+                setHelpOpen(true);
+                return;
+              }
+              if (cmd === '/regen') {
+                await props.onRegenerateLast();
+                return;
+              }
+
+              await props.onSubmit(cmd);
             }}
-            onSubmit={submit}
-            disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen || !!state.pendingPermission}
           />
+        ) : null}
+
+        {searchOpen ? (
+          <SearchPanel
+            messages={state.messages}
+            onClose={() => setSearchOpen(false)}
+            onJumpTo={(id, hits) => {
+              setSearchOpen(false);
+              if (!returnState) setReturnState({ scrollOffset, threadRootId, threadLeafId });
+              setAnchorMessageId(id);
+              if (hits?.length) {
+                setLastSearchHits(hits);
+                setLastSearchIndex(Math.max(0, hits.indexOf(id)));
+              }
+            }}
+          />
+        ) : null}
+
+        {exportOpen ? (
+          <ExportPanel
+            defaultPath={`./ ${props.sessionName}.md`}
+            onClose={() => setExportOpen(false)}
+            onExport={async (format, path) => {
+              await props.onSubmit(`/export-ui ${format} ${path}`);
+            }}
+          />
+        ) : null}
+
+        {settingsOpen ? (
+          <SettingsPanel
+            settings={settings}
+            onClose={() => setSettingsOpen(false)}
+            onUpdate={async (next) => {
+              setSettings(next);
+              await props.onSubmit(`/settings ${next.theme} ${next.compactMode ? 'compact' : 'normal'} ${next.showLineNumbers ? 'lines' : 'nolines'}`);
+            }}
+          />
+        ) : null}
+
+        {sessionsOpen ? (
+          <SessionsPanel
+            sessions={state.sessions}
+            onClose={() => setSessionsOpen(false)}
+            onLoad={async (id) => {
+              await props.onSubmit(`/load-session ${id}`);
+              setSessionsOpen(false);
+            }}
+            onDelete={async (id) => {
+              await props.onSubmit(`/delete-session ${id}`);
+            }}
+          />
+        ) : null}
+
+        {pinsOpen ? (
+          <PinsPanel
+            messages={state.messages}
+            onClose={() => setPinsOpen(false)}
+            onJumpTo={(id) => {
+              setPinsOpen(false);
+              setAnchorMessageId(id);
+            }}
+          />
+        ) : null}
+
+        {editLastOpen ? (
+          <EditLastPanel
+            initial={(() => {
+              const lastUser = [...state.messages].reverse().find((m) => m.role === 'user');
+              return lastUser ? getTextFromContent(lastUser.content) : '';
+            })()}
+            onClose={() => setEditLastOpen(false)}
+            onSubmit={async (newText) => {
+              await props.onSubmit(`/edit-last ${JSON.stringify(newText)}`);
+            }}
+          />
+        ) : null}
+
+        {editMessageOpen ? (
+          <EditMessagePanel
+            messages={state.messages}
+            onClose={() => setEditMessageOpen(false)}
+            onEditAndBranch={async (messageId, newContent) => {
+              await props.onSubmit(`/edit-branch ${messageId} ${JSON.stringify(newContent)}`);
+              setThreadRootId(messageId);
+            }}
+          />
+        ) : null}
+
+        {analyticsOpen ? (
+          <AnalyticsPanel
+            messages={state.messages}
+            tokens={state.tokens}
+            cost={state.cost}
+            tools={state.tools}
+            usage={state.usage}
+            model={props.model}
+            provider={state.provider}
+            onClose={() => setAnalyticsOpen(false)}
+          />
+        ) : null}
+
+        {searchAllOpen ? (
+          <SearchAllPanel
+            hits={state.globalHits}
+            onClose={() => setSearchAllOpen(false)}
+            onQuery={async (q) => {
+              await props.onSubmit(`/search-all ${JSON.stringify(q)}`);
+            }}
+            onSelect={async (hit) => {
+              await props.onSubmit(`/load-session ${hit.sessionId}`);
+              setAnchorMessageId(hit.messageId);
+              setSearchAllOpen(false);
+            }}
+          />
+        ) : null}
+
+        {branchOpen ? (
+          <BranchPanel
+            messages={state.messages}
+            onClose={() => setBranchOpen(false)}
+            onSelectParent={async (parentId) => {
+              await props.onSubmit(`/branch ${parentId}`);
+              setThreadRootId(parentId);
+            }}
+          />
+        ) : null}
+
+        {branchesOpen ? (
+          <BranchesPanel
+            messages={state.messages}
+            onClose={() => setBranchesOpen(false)}
+            onSelectThread={async (rootId) => {
+              setThreadRootId(rootId);
+              await props.onSubmit(`/thread-root ${rootId ?? ''}`);
+            }}
+          />
+        ) : null}
+
+        {toolRunsOpen ? (
+          <ToolRunDiffsPanel
+            diffGroups={state.diffGroups}
+            onClose={() => setToolRunsOpen(false)}
+            onSelectRun={(id) => {
+              setSelectedToolRunId(id);
+              setToolRunsOpen(false);
+              setDiffReviewOpen(true);
+            }}
+          />
+        ) : null}
+
+        {siblingsOpen && threadRootId ? (
+          <SiblingBranchesPanel
+            messages={state.messages}
+            parentId={threadRootId}
+            onClose={() => setSiblingsOpen(false)}
+            onSelectChild={async (childId) => {
+              setThreadLeafId(childId);
+              await props.onSubmit(`/thread-leaf ${childId}`);
+            }}
+          />
+        ) : null}
+
+        {tagOpen ? (
+          <TagPanel
+            messages={state.messages}
+            onClose={() => setTagOpen(false)}
+            onTag={async (id, tag) => props.onSubmit(`/tag-msg ${id} ${JSON.stringify(tag)}`)}
+            onUntag={async (id, tag) => props.onSubmit(`/untag-msg ${id} ${JSON.stringify(tag)}`)}
+          />
+        ) : null}
+
+        {deleteMsgOpen ? (
+          <DeleteMessagePanel
+            messages={state.messages}
+            onClose={() => setDeleteMsgOpen(false)}
+            onDelete={async (id) => {
+              await props.onSubmit(`/delete-msg ${id}`);
+            }}
+          />
+        ) : null}
+
+        {editAssistantOpen ? (
+          <EditAssistantPanel
+            messages={state.messages}
+            onClose={() => setEditAssistantOpen(false)}
+            onEdit={async (id, content) => {
+              await props.onSubmit(`/edit-asst ${id} ${JSON.stringify(content)}`);
+            }}
+          />
+        ) : null}
+
+        {pruneBranchOpen ? (
+          <PruneBranchPanel
+            messages={state.messages}
+            onClose={() => setPruneBranchOpen(false)}
+            onPrune={async (leafId) => {
+              await props.onSubmit(`/prune-branch ${leafId}`);
+            }}
+          />
+        ) : null}
+
+        {branchMapOpen ? (
+          <BranchMapPanel
+            messages={state.messages}
+            onClose={() => setBranchMapOpen(false)}
+            onSelectNode={async (id) => {
+              setAnchorMessageId(id);
+              setThreadRootId(id);
+              setThreadLeafId(null);
+              await props.onSubmit(`/thread-root ${id}`);
+              setBranchMapOpen(false);
+            }}
+          />
+        ) : null}
+
+        {importOpen ? (
+          <ImportSessionPanel
+            onClose={() => setImportOpen(false)}
+            onImport={async (p) => {
+              await props.onSubmit(`/import ${p}`);
+            }}
+          />
+        ) : null}
+
+        {helpOpen ? (
+          <HelpOverlayPanel onClose={() => setHelpOpen(false)} />
+        ) : null}
+
+        {multiLineOpen ? (
+          <MultiLineEditPanel
+            initialValue={input}
+            onClose={() => setMultiLineOpen(false)}
+            onSubmit={(val) => {
+              setInput(val);
+              setMultiLineOpen(false);
+            }}
+          />
+        ) : null}
+
+        <Box flexDirection="column" flexShrink={0}>
+          {!anyModal && !diffReviewOpen && input.startsWith('/') && input.length > 1 && (
+            <SlashCommandOverlay query={input} commands={commands} />
+          )}
+          <Box marginTop={1} marginX={1}>
+            <PromptInput
+              value={input}
+              recentCommands={state.recentCommands}
+              onChange={(v) => {
+                if (v === '?') {
+                  setHelpOpen(!helpOpen);
+                  return;
+                }
+                setInput(v);
+              }}
+              onSubmit={submit}
+              disabled={paletteOpen || searchOpen || exportOpen || settingsOpen || sessionsOpen || pinsOpen || editLastOpen || editMessageOpen || analyticsOpen || searchAllOpen || branchOpen || branchesOpen || diffReviewOpen || toolRunsOpen || siblingsOpen || tagOpen || deleteMsgOpen || editAssistantOpen || pruneBranchOpen || branchMapOpen || importOpen || helpOpen || multiLineOpen || !!state.pendingPermission}
+            />
+          </Box>
+          <Toasts toasts={state.toasts} />
+          <Box flexDirection="row" paddingX={1} marginTop={1}>
+            <Text dimColor>Hotkeys: </Text>
+            <Text bold color={theme.accent as any}>/ </Text><Text dimColor> Palette · </Text>
+            <Text bold color={theme.accent as any}>Ctrl+E </Text><Text dimColor> Multi-line · </Text>
+            <Text bold color={theme.accent as any}>C </Text><Text dimColor> Copy · </Text>
+            <Text bold color={theme.accent as any}>S </Text><Text dimColor> Settings · </Text>
+            <Text bold color={theme.accent as any}>Esc </Text><Text dimColor> Exit · </Text>
+            <Text bold color={theme.accent as any}>? </Text><Text dimColor> Help</Text>
+          </Box>
+          <StatusBar hint={dynamicHint} isGenerating={state.isGenerating} step={state.step} />
         </Box>
-        <Toasts toasts={state.toasts} />
-        <StatusBar hint={dynamicHint} isGenerating={false} />
       </Box>
     </Box>
   );

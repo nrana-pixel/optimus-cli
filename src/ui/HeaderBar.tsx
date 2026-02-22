@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { ThemeName } from './Theme.js';
+import { useTheme } from './Theme.js';
 
 export function HeaderBar(props: {
   model: string;
@@ -8,18 +8,19 @@ export function HeaderBar(props: {
   provider: string;
   toolsEnabled: boolean;
   planMode: boolean;
-  themeName: ThemeName;
+  themeName: string;
   columns: number;
   branch?: string;
   cwd?: string;
 }) {
+  const theme = useTheme();
   const badge = props.planMode
     ? 'PLAN'
     : props.toolsEnabled
       ? 'TOOLS'
       : 'CHAT';
 
-  const badgeColor = props.planMode ? 'yellow' : props.toolsEnabled ? 'green' : 'gray';
+  const badgeColor = props.planMode ? theme.warn : props.toolsEnabled ? theme.success : theme.dim;
 
   const title = 'OPTIMUS';
 
@@ -27,7 +28,7 @@ export function HeaderBar(props: {
     <Box flexDirection="column" width={props.columns - 2} marginX={1} marginTop={0}>
       <Box
         borderStyle="round"
-        borderColor="blue"
+        borderColor={theme.accent as any}
         paddingX={1}
         paddingY={0}
         flexDirection="row"
@@ -35,10 +36,10 @@ export function HeaderBar(props: {
       >
         <Box flexDirection="column">
           <Box>
-            <Text bold color="blueBright"> {title} </Text>
-            <Text color="blue">│</Text>
+            <Text bold color={theme.accent as any}> {title} </Text>
+            <Text color={theme.accent as any}>│</Text>
             <Text dimColor> AI AGENT </Text>
-            <Text color="blue">│</Text>
+            <Text color={theme.accent as any}>│</Text>
             <Box marginLeft={1}>
               <Text backgroundColor={badgeColor as any} color="black" bold> {badge} </Text>
             </Box>
@@ -46,7 +47,7 @@ export function HeaderBar(props: {
           <Box marginTop={0}>
             <Text dimColor> {props.cwd || process.cwd()} </Text>
             {props.branch && (
-              <Text color="magenta"> branch: {props.branch} </Text>
+              <Text color={theme.dim as any}> branch: {props.branch} </Text>
             )}
           </Box>
         </Box>
@@ -54,11 +55,11 @@ export function HeaderBar(props: {
         <Box flexDirection="column" alignItems="flex-end">
           <Box>
             <Text dimColor>Provider: </Text>
-            <Text color="white" bold>{props.provider}</Text>
+            <Text color={theme.text as any} bold>{props.provider}</Text>
           </Box>
           <Box>
             <Text dimColor>Model: </Text>
-            <Text color="cyan">{props.model}</Text>
+            <Text color={theme.accent as any}>{props.model}</Text>
           </Box>
           <Box>
             <Text dimColor>Session: </Text>

@@ -45,7 +45,7 @@ export interface ConversationSession {
 
   // Persisted UI settings
   settings?: {
-    theme?: 'dark' | 'light' | 'high-contrast';
+    theme?: 'sun' | 'moon' | 'universe';
     compactMode?: boolean;
     showLineNumbers?: boolean;
     // Ink UI persisted state
@@ -69,7 +69,7 @@ export class ConversationService {
   /** Backward-compatible migration for older session JSON formats */
   private _migrateSessionInPlace(session: ConversationSession) {
     // Ensure settings exists
-    session.settings ??= { theme: 'dark', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
+    session.settings ??= { theme: 'moon', compactMode: false, showLineNumbers: false, recentCommands: [], threadRootId: null, threadLeafId: null, usage: {}, provider: 'unknown' };
     session.settings.recentCommands ??= [];
     if (session.settings.threadRootId === undefined) session.settings.threadRootId = null;
     if (session.settings.threadLeafId === undefined) session.settings.threadLeafId = null;
@@ -224,8 +224,8 @@ export class ConversationService {
 
     return this.currentSession.messages
       .map((msg) => {
-        const text = Array.isArray(msg.content) 
-          ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n') 
+        const text = Array.isArray(msg.content)
+          ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
           : msg.content;
         return `${msg.role.toUpperCase()}: ${text}`;
       })

@@ -30,6 +30,7 @@ import { truncateMiddle } from '../utils/truncate.js';
 import { createTwoFilesPatch } from 'diff';
 import { UnifiedExecService } from './unified-exec.service.js';
 import type { IndexService } from './index.service.js';
+import type { MigrationService } from './migration.service.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -46,24 +47,25 @@ export type ToolName =
   | 'run_command'
   | 'run_tests'
   | 'write_stdin'
+  | 'deploy_command'
   | 'git_status'
   | 'git_diff'
   | 'git_log';
 
 /** Metadata for files that were written this session */
 export interface WrittenFile {
-  path:     string;   // relative path from workingDir
-  absPath:  string;
-  lines:    number;
-  isNew:    boolean;  // true = created, false = modified
+  path: string;   // relative path from workingDir
+  absPath: string;
+  lines: number;
+  isNew: boolean;  // true = created, false = modified
 }
 
 /** Snapshot of a file before modification (for /undo) */
 export interface FileSnapshot {
-  absPath:  string;
-  relPath:  string;
-  existed:  boolean;
-  content:  string | null;   // null if file didn't exist
+  absPath: string;
+  relPath: string;
+  existed: boolean;
+  content: string | null;   // null if file didn't exist
 }
 
 export interface ToolCall {
@@ -72,10 +74,10 @@ export interface ToolCall {
 }
 
 export interface ToolResult {
-  name:       ToolName;
-  args:       Record<string, string>;
-  output:     string;
-  error?:     string;
+  name: ToolName;
+  args: Record<string, string>;
+  output: string;
+  error?: string;
   durationMs: number;
 }
 
@@ -100,12 +102,12 @@ function isSafeCommand(cmd: string): boolean {
 
 export class ToolsService {
   private readonly MAX_FILE_BYTES = 200_000;   // 200 KB cap per file read
-  private readonly MAX_RESULTS    = 30;         // search result cap
+  private readonly MAX_RESULTS = 30;         // search result cap
   private readonly MAX_CMD_OUTPUT = 8_000;      // chars
 
   public unifiedExec = new UnifiedExecService();
 
-  constructor(private workingDir: string) {}
+  constructor(private workingDir: string) { }
 
   // ─── Execute dispatcher ─────────────────────────────────────────────────
 
@@ -117,6 +119,9 @@ export class ToolsService {
 
   /** Whether this is plan-only mode (no writes) */
   public planMode: boolean = false;
+
+  /** MigrationService injection for tracking DB schema changes */
+  public migrationService: MigrationService | null = null;
 
   /**
    * Optional IndexService injection — when provided, find_symbol, lookup_symbol,
@@ -209,6 +214,9 @@ export class ToolsService {
         case 'write_stdin':
           output = await this.unifiedExec.writeStdin(call.args.id ?? '', call.args.text ?? '');
           break;
+        case 'deploy_command':
+          output = await this.deployCommand(call.args.command ?? '');
+          break;
         case 'git_status':
           output = this.gitStatus();
           break;
@@ -268,10 +276,17 @@ export class ToolsService {
     this._snapshot(abs, rel);
 
     const isNew = !existsSync(abs);
-    const dir   = dirname(abs);
+    const dir = dirname(abs);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
     writeFileSync(abs, content, 'utf-8');
+
+    if (this.migrationService) {
+      const dbExts = ['.sql', '.prisma', '.drizzle'];
+      if (dbExts.some(ext => filePath.endsWith(ext)) || filePath.includes('migration')) {
+        this.migrationService.recordSchemaChange(filePath, content);
+      }
+    }
 
     const lines = content.split('\n').length;
     this.written.push({ path: filePath, absPath: abs, lines, isNew });
@@ -307,6 +322,13 @@ export class ToolsService {
     const updated = original.split(oldContent).join(newContent);
     writeFileSync(abs, updated, 'utf-8');
 
+    if (this.migrationService) {
+      const dbExts = ['.sql', '.prisma', '.drizzle'];
+      if (dbExts.some(ext => filePath.endsWith(ext)) || filePath.includes('migration')) {
+        this.migrationService.recordSchemaChange(filePath, updated);
+      }
+    }
+
     const lines = updated.split('\n').length;
     this.written.push({ path: filePath, absPath: abs, lines, isNew: false });
 
@@ -323,10 +345,10 @@ export class ToolsService {
 
     const abs = resolve(this.workingDir, path);
     const rel = relative(this.workingDir, abs);
-    
+
     let oldContent = '';
     let newContent = '';
-    
+
     try {
       if (existsSync(abs)) {
         oldContent = readFileSync(abs, 'utf-8');
@@ -428,10 +450,10 @@ export class ToolsService {
         });
 
       entries.forEach((entry, i) => {
-        const last      = i === entries.length - 1;
+        const last = i === entries.length - 1;
         const connector = last ? '└── ' : '├── ';
-        const childPfx  = last ? '    ' : '│   ';
-        const label     = entry.isDirectory() ? `📁 ${entry.name}/` : entry.name;
+        const childPfx = last ? '    ' : '│   ';
+        const label = entry.isDirectory() ? `📁 ${entry.name}/` : entry.name;
         lines.push(`${prefix}${connector}${label}`);
         if (entry.isDirectory()) {
           walk(join(dir, entry.name), prefix + childPfx, depth + 1);
@@ -493,7 +515,7 @@ export class ToolsService {
 
         try {
           const content = readFileSync(abs, 'utf-8');
-          const lines   = content.split('\n');
+          const lines = content.split('\n');
           lines.forEach((line, i) => {
             if (results.length < this.MAX_RESULTS && re.test(line)) {
               const rel = relative(this.workingDir, abs).replace(/\\/g, '/');
@@ -555,6 +577,28 @@ export class ToolsService {
         preserveHeadLines: 40,
         preserveTailLines: 40
       });
+    }
+  }
+
+  private async deployCommand(cmd: string): Promise<string> {
+    if (!cmd) return 'deploy_command requires a command argument';
+    const trimmed = cmd.trim();
+    const approvedClis = ['aws', 'gcloud', 'kubectl', 'doctl', 'flyctl', 'vercel', 'wrangler', 'gh', 'cloudpe'];
+    const firstWord = trimmed.split(/\s+/)[0].toLowerCase();
+
+    if (!approvedClis.includes(firstWord)) {
+      return `deploy_command is restricted to approved Cloud/CI CLIs: ${approvedClis.join(', ')}.`;
+    }
+
+    const dangerousPatterns = [/\bsudo\b/, /\bsu\b/, /\brm\s+-rf\b/];
+    if (dangerousPatterns.some(p => p.test(trimmed))) {
+      return `Blocked: Prohibited system pattern in deployment command.`;
+    }
+
+    try {
+      return await this.unifiedExec.spawn(trimmed, [], this.workingDir);
+    } catch (e: any) {
+      return `Deployment tool failed: ${e.message}`;
     }
   }
 
@@ -624,7 +668,7 @@ export class ToolsService {
       }
     }
     this.snapshots = [];
-    this.written   = [];
+    this.written = [];
     return restored;
   }
 
@@ -923,6 +967,20 @@ export class ToolsService {
                 text: { type: 'string', description: 'The text to send to the process' }
               },
               required: ['id', 'text']
+            }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'deploy_command',
+            description: 'Run deployment commands (aws, gcloud, kubectl, vercel, gh, etc.). Use this for infrastructure changes, cloud deployments, or CI/CD updates.',
+            parameters: {
+              type: 'object',
+              properties: {
+                command: { type: 'string', description: 'The deployment command to run' }
+              },
+              required: ['command']
             }
           }
         }
